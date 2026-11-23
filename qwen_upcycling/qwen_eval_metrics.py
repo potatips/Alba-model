@@ -1,210 +1,464 @@
-import os
+import base64
+import math
 import time
-import json
+from io import BytesIO
+from typing import Dict, List
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from qwen_moefication import QwenOSMoEBlock, _locate_decoder_layers, count_model_params
+
 
 def linear_cka(X: torch.Tensor, Y: torch.Tensor) -> float:
-    X = X - X.mean(dim=0, keepdim=True)
-    Y = Y - Y.mean(dim=0, keepdim=True)
-    dot_X = torch.matmul(X, X.t())
-    dot_Y = torch.matmul(Y, Y.t())
+    Xc = X - X.mean(dim=0, keepdim=True)
+    Yc = Y - Y.mean(dim=0, keepdim=True)
+    dot_X = torch.matmul(Xc, Xc.t())
+    dot_Y = torch.matmul(Yc, Yc.t())
     hsic_xy = torch.sum(dot_X * dot_Y)
     hsic_xx = torch.sum(dot_X * dot_X)
     hsic_yy = torch.sum(dot_Y * dot_Y)
-    cka = hsic_xy / (torch.sqrt(hsic_xx) * torch.sqrt(hsic_yy) + 1e-12)
-    return float(cka.item())
+    cka = hsic_xy / (torch.sqrt(hsic_xx * hsic_yy) + 1e-12)
+    return float(torch.clamp(cka, 0.0, 1.0).item())
 
-def evaluate_effective_depth(model, tokenizer, test_texts, max_length: int = 512, device: str = "cuda"):
+
+def _token_norm_erank(hs: torch.Tensor) -> float:
+    flat = hs.reshape(-1, hs.size(-1)).float()
+    normed = F.normalize(flat, p=2, dim=-1, eps=1e-8)
+    centered = normed - normed.mean(dim=0, keepdim=True)
+    s = torch.linalg.svdvals(centered)
+    s_pos = s[s > 1e-7]
+    if s_pos.numel() == 0:
+        return 0.0
+    p = s_pos / s_pos.sum()
+    entropy = -(p * torch.log(p + 1e-12)).sum()
+    erank = torch.exp(entropy).item()
+    denom = float(min(flat.size(0), flat.size(1)))
+    return float(erank / max(denom, 1.0))
+
+
+def _fast_spectral_norm(W: torch.Tensor, iters: int = 8) -> float:
+    Wf = W.float()
+    if Wf.size(0) < Wf.size(1):
+        Wf = Wf.t()
+    v = torch.randn(Wf.size(1), device=Wf.device, dtype=torch.float32)
+    v = v / (v.norm() + 1e-12)
+    for _ in range(iters):
+        u = torch.mv(Wf, v)
+        u = u / (u.norm() + 1e-12)
+        v = torch.mv(Wf.t(), u)
+        v = v / (v.norm() + 1e-12)
+    sigma = torch.dot(u, torch.mv(Wf, v)).abs().item()
+    return max(sigma, 1e-8)
+
+
+def evaluate_domain_bpb(
+    model,
+    tokenizer,
+    texts: List[str],
+    max_length: int = 512,
+    batch_size: int = 4,
+    device: str = "cuda",
+) -> Dict[str, float]:
     model.eval()
-    all_renewals = []
-    
+    total_nll = 0.0
+    total_tokens = 0
+    total_bytes = 0
+
     with torch.no_grad():
-        for text in test_texts:
-            inputs = tokenizer(text, return_tensors="pt", max_length=max_length, truncation=True)
-            if torch.cuda.is_available() and device == "cuda":
-                inputs = {k: v.to(model.device) for k, v in inputs.items()}
-                
-            outputs = model(**inputs, output_hidden_states=True)
-            hidden_states = outputs.hidden_states
-            n_layers = len(hidden_states) - 1
-            
-            sample_renewals = []
-            for l in range(n_layers):
-                h_curr = hidden_states[l].squeeze(0).float()
-                h_next = hidden_states[l + 1].squeeze(0).float()
-                cka_val = linear_cka(h_curr, h_next)
-                sample_renewals.append(1.0 - cka_val)
-                
-            all_renewals.append(sample_renewals)
-            
-    mean_renewals = np.mean(all_renewals, axis=0)
-    d_eff = float(np.sum(mean_renewals))
-    depth_ratio = float(d_eff / len(mean_renewals))
-    
+        for i in range(0, len(texts), batch_size):
+            chunk = texts[i : i + batch_size]
+            enc = tokenizer(
+                chunk,
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_length,
+                padding=True,
+            )
+            input_ids = enc["input_ids"].to(device)
+            attention_mask = enc["attention_mask"].to(device)
+            labels = input_ids.clone()
+            labels[attention_mask == 0] = -100
+
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, use_cache=False)
+            valid_toks = int((labels[:, 1:] != -100).sum().item())
+            if valid_toks > 0:
+                total_nll += float(outputs.loss.item()) * valid_toks
+                total_tokens += valid_toks
+
+            for b_idx in range(input_ids.size(0)):
+                valid_ids = input_ids[b_idx][attention_mask[b_idx] == 1]
+                decoded = tokenizer.decode(valid_ids, skip_special_tokens=True)
+                total_bytes += max(len(decoded.encode("utf-8")), 1)
+
+    avg_loss = total_nll / max(total_tokens, 1)
+    ppl = float(math.exp(min(avg_loss, 20.0)))
+    bpb = float((total_nll / max(total_bytes, 1)) / math.log(2.0))
     return {
-        "n_layers": len(mean_renewals),
-        "effective_depth": d_eff,
-        "depth_ratio": depth_ratio,
-        "renewals": mean_renewals.tolist()
+        "loss": round(avg_loss, 4),
+        "ppl": round(ppl, 3),
+        "bpb": round(bpb, 4),
+        "tokens": total_tokens,
     }
 
-def evaluate_routing_entropy(model, tokenizer, test_texts, max_length: int = 512, device: str = "cuda"):
-    model.eval()
-    layer_entropies = []
-    layer_loads = []
-    
-    hooks = []
-    captured_logits = []
-    
-    def get_hook():
-        def hook_fn(module, inputs, outputs):
-            if isinstance(outputs, tuple) and len(outputs) >= 3:
-                raw_logits = outputs[2]
-                captured_logits.append(raw_logits.detach())
-        return hook_fn
 
-    for module in model.modules():
-        if module.__class__.__name__ == "QwenOSMoEBlock":
-            hooks.append(module.register_forward_hook(get_hook()))
-            
-    if not hooks:
-        return {"has_moe": False, "mean_entropy": 0.0, "load_cv": 0.0}
+def evaluate_residual_and_moe_geometry(
+    model,
+    tokenizer,
+    probe_texts: List[str],
+    max_length: int = 256,
+    device: str = "cuda",
+) -> Dict:
+    model.eval()
+    layers = _locate_decoder_layers(model)
+    last_raw = {}
+
+    def _capture_last(_, __, out):
+        t = out[0] if isinstance(out, tuple) else out
+        last_raw["h"] = t.detach()
+
+    hook_last = layers[-1].register_forward_hook(_capture_last)
+
+    joined = "\n\n".join(probe_texts[:8])
+    enc = tokenizer(joined, return_tensors="pt", truncation=True, max_length=max_length)
+    input_ids = enc["input_ids"].to(device)
+    attention_mask = enc["attention_mask"].to(device)
 
     with torch.no_grad():
-        for text in test_texts:
-            captured_logits.clear()
-            inputs = tokenizer(text, return_tensors="pt", max_length=max_length, truncation=True)
-            if torch.cuda.is_available() and device == "cuda":
-                inputs = {k: v.to(model.device) for k, v in inputs.items()}
-                
-            _ = model(**inputs)
-            
-            for logits in captured_logits:
-                probs = F.softmax(logits, dim=-1)
-                entropy = -torch.sum(probs * torch.log(probs + 1e-12), dim=-1).mean().item()
-                layer_entropies.append(entropy)
-                
-                load = probs.sum(dim=[0, 1]).cpu().numpy()
-                cv = float(np.std(load) / (np.mean(load) + 1e-12))
-                layer_loads.append(cv)
+        _ = model(input_ids=input_ids[:, : min(32, input_ids.size(1))], use_cache=False)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        dt = max(time.perf_counter() - t0, 1e-6)
 
-    for h in hooks:
-        h.remove()
-        
+    hook_last.remove()
+    throughput = float(input_ids.numel() / dt)
+
+    hs_list = list(outputs.hidden_states)
+    if "h" in last_raw:
+        hs_list[-1] = last_raw["h"]
+
+    conflict_curve = []
+    ortho_energy_curve = []
+    erank_curve = []
+    bi_curve = []
+    cka_renewal_curve = []
+
+    for l in range(len(hs_list) - 1):
+        x_l = hs_list[l].squeeze(0).float()
+        x_next = hs_list[l + 1].squeeze(0).float()
+        u_l = x_next - x_l
+
+        dot = (x_l * u_l).sum(dim=-1)
+        denom = x_l.norm(dim=-1) * u_l.norm(dim=-1) + 1e-8
+        rho = torch.clamp(dot / denom, -1.0, 1.0)
+
+        conflict_curve.append(round(float((rho < 0).float().mean().item() * 100.0), 3))
+        ortho_energy_curve.append(round(float((1.0 - rho.pow(2)).mean().item() * 100.0), 3))
+        erank_curve.append(round(_token_norm_erank(x_next), 4))
+
+        cos_seq = F.cosine_similarity(x_l, x_next, dim=-1).mean().item()
+        bi_curve.append(round(float(1.0 - cos_seq), 4))
+        cka_renewal_curve.append(round(float(1.0 - linear_cka(x_l, x_next)), 4))
+
+    moe_entropy_curve = []
+    moe_ortho_curve = []
+    max_vio_global = 0.0
+    max_vio_batch = 0.0
+    max_lse = 0.0
+    has_moe = False
+
+    for m in model.modules():
+        if isinstance(m, QwenOSMoEBlock):
+            has_moe = True
+            with torch.no_grad():
+                gf = F.normalize(m.router.gate.float(), p=2, dim=-1, eps=1e-7)
+                gram = torch.matmul(gf, gf.t())
+                eye = torch.eye(m.num_experts, device=gf.device, dtype=torch.float32)
+                defect = torch.sqrt(torch.sum((gram - eye) ** 2) / (m.num_experts * (m.num_experts - 1))).item()
+                moe_ortho_curve.append(round(float(defect), 4))
+
+                if m.last_router_logits is not None:
+                    logits = m.last_router_logits.float().reshape(-1, m.num_experts)
+                    lse = float(torch.logsumexp(logits, dim=-1).max().item())
+                    max_lse = max(max_lse, lse)
+
+                    probs = F.softmax(logits, dim=-1)
+                    mean_p = probs.mean(dim=0)
+                    h_marg = float(-(mean_p * torch.log(mean_p + 1e-12)).sum().item())
+                    h_pct = (h_marg / math.log(m.num_experts)) * 100.0
+                    moe_entropy_curve.append(round(h_pct, 2))
+
+                    _, topk_idx = torch.topk(logits, m.top_k, dim=-1)
+                    counts = torch.bincount(topk_idx.reshape(-1), minlength=m.num_experts).float()
+                    avg_load = counts.mean().item()
+                    if avg_load > 0:
+                        vio = float((counts.max().item() - avg_load) / avg_load)
+                        max_vio_global = max(max_vio_global, vio)
+                        max_vio_batch = max(max_vio_batch, vio)
+
+    srank_curve = []
+    for layer in layers:
+        layer_sranks = []
+        for name, param in layer.named_parameters():
+            if param.dim() == 2 and min(param.shape) >= 64:
+                if any(k in name for k in ("q_proj", "v_proj", "o_proj", "up_proj", "down_proj")):
+                    wf = param.detach().float()
+                    frob_sq = float(torch.sum(wf * wf).item())
+                    spec = _fast_spectral_norm(wf, iters=6)
+                    srank_ratio = (frob_sq / (spec * spec + 1e-12)) / float(min(wf.shape))
+                    layer_sranks.append(srank_ratio)
+        if layer_sranks:
+            srank_curve.append(round(float(np.mean(layer_sranks)), 4))
+
     return {
-        "has_moe": True,
-        "mean_entropy": float(np.mean(layer_entropies)) if layer_entropies else 0.0,
-        "load_cv": float(np.mean(layer_loads)) if layer_loads else 0.0,
-        "layer_entropies": layer_entropies
+        "throughput_tok_s": round(throughput, 1),
+        "avg_conflict_pct": round(float(np.mean(conflict_curve)), 2),
+        "avg_ortho_energy_pct": round(float(np.mean(ortho_energy_curve)), 2),
+        "avg_erank_norm": round(float(np.mean(erank_curve)), 4),
+        "avg_bi": round(float(np.mean(bi_curve)), 4),
+        "avg_cka_renewal": round(float(np.mean(cka_renewal_curve)), 4),
+        "effective_depth_ratio_pct": round(float(np.mean(cka_renewal_curve) * 100.0), 2),
+        "avg_srank_w": round(float(np.mean(srank_curve)), 4) if srank_curve else 0.0,
+        "is_moe": has_moe,
+        "avg_moe_entropy_pct": round(float(np.mean(moe_entropy_curve)), 2) if moe_entropy_curve else 0.0,
+        "avg_moe_ortho_defect": round(float(np.mean(moe_ortho_curve)), 4) if moe_ortho_curve else 0.0,
+        "max_vio_global": round(max_vio_global, 3),
+        "max_vio_batch": round(max_vio_batch, 3),
+        "max_lse": round(max_lse, 2),
+        "conflict_curve": conflict_curve,
+        "erank_curve": erank_curve,
+        "cka_renewal_curve": cka_renewal_curve,
+        "srank_curve": srank_curve,
+        "moe_entropy_curve": moe_entropy_curve,
+        "moe_ortho_curve": moe_ortho_curve,
     }
 
-def evaluate_spectral_isometry(model):
-    kappas = []
-    spectra = []
-    
-    for name, param in model.named_parameters():
-        if param.dim() == 2 and param.size(0) >= 128 and param.size(1) >= 128:
-            if any(k in name for k in ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]):
-                W = param.detach().float()
-                s = torch.linalg.svdvals(W)
-                kappa = float((s[0] / (s[-1] + 1e-12)).item())
-                kappas.append(kappa)
-                if len(spectra) < 5:
-                    spectra.append(s.cpu().numpy().tolist())
-                    
+
+def evaluate_qwen_variant_full(
+    model,
+    tokenizer,
+    eval_logic_texts: List[str],
+    eval_code_texts: List[str],
+    max_length: int = 512,
+    eval_batch_size: int = 4,
+    device: str = "cuda",
+) -> Dict:
+    params_info = count_model_params(model)
+    logic_res = evaluate_domain_bpb(model, tokenizer, eval_logic_texts, max_length=max_length, batch_size=eval_batch_size, device=device)
+    code_res = evaluate_domain_bpb(model, tokenizer, eval_code_texts, max_length=max_length, batch_size=eval_batch_size, device=device)
+    overall_bpb = round(0.5 * (logic_res["bpb"] + code_res["bpb"]), 4)
+    overall_loss = round(0.5 * (logic_res["loss"] + code_res["loss"]), 4)
+    overall_ppl = round(float(math.exp(min(overall_loss, 20.0))), 3)
+
+    geom = evaluate_residual_and_moe_geometry(
+        model,
+        tokenizer,
+        eval_logic_texts[:4] + eval_code_texts[:4],
+        max_length=256,
+        device=device,
+    )
+
     return {
-        "mean_condition_number": float(np.mean(kappas)) if kappas else 1.0,
-        "min_condition_number": float(np.min(kappas)) if kappas else 1.0,
-        "max_condition_number": float(np.max(kappas)) if kappas else 1.0
+        "total_params_b": params_info["total_params_b"],
+        "active_params_b": params_info["active_params_b"],
+        "overall_bpb": overall_bpb,
+        "overall_ppl": overall_ppl,
+        "overall_loss": overall_loss,
+        "logic_bpb": logic_res["bpb"],
+        "logic_ppl": logic_res["ppl"],
+        "code_bpb": code_res["bpb"],
+        "code_ppl": code_res["ppl"],
+        **geom,
     }
 
-def evaluate_throughput(model, tokenizer, sample_text: str, steps: int = 30, max_length: int = 512, device: str = "cuda"):
-    model.eval()
-    inputs = tokenizer(sample_text, return_tensors="pt", max_length=max_length, truncation=True)
-    if torch.cuda.is_available() and device == "cuda":
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
-        
-    n_tokens = inputs["input_ids"].numel()
-    
-    with torch.no_grad():
-        for _ in range(5):
-            _ = model(**inputs)
-            
-    if torch.cuda.is_available() and device == "cuda":
-        torch.cuda.synchronize()
-        
-    t0 = time.time()
-    with torch.no_grad():
-        for _ in range(steps):
-            _ = model(**inputs)
-            
-    if torch.cuda.is_available() and device == "cuda":
-        torch.cuda.synchronize()
-        
-    elapsed = time.time() - t0
-    tok_per_sec = float((n_tokens * steps) / elapsed)
-    return tok_per_sec
 
-def plot_qwen_comparison_dashboard(orig_metrics, upcycled_metrics, save_path: str):
-    plt.rcParams['font.family'] = 'DejaVu Sans'
-    plt.rcParams['font.size'] = 10
-    plt.rcParams['axes.linewidth'] = 1.2
-    plt.rcParams['grid.alpha'] = 0.35
-    plt.rcParams['grid.linestyle'] = '--'
+def generate_ablation_html_report(
+    results: Dict[str, Dict],
+    output_html_path: str = "qwen3b_ablation_report.html",
+    output_png_path: str = "qwen3b_ablation_grid.png",
+) -> str:
+    fig, axes = plt.subplots(2, 3, figsize=(21, 12), dpi=150)
+    plt.subplots_adjust(hspace=0.36, wspace=0.26)
 
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10), dpi=300)
+    names = list(results.keys())
+    colors = plt.cm.tab10(np.linspace(0, 0.9, max(len(names), 1)))
 
-    layers = np.arange(1, orig_metrics["n_layers"] + 1)
-    ax1.plot(layers, orig_metrics["renewals"], 'o--', color='#3b82f6', label=f'Qwen2.5-0.5B Dense (D_eff={orig_metrics["effective_depth"]:.2f})')
-    ax1.plot(layers, upcycled_metrics["renewals"], 's-', color='#16a34a', label=f'Qwen-OS-MoE Upcycled (D_eff={upcycled_metrics["effective_depth"]:.2f})')
-    ax1.fill_between(layers, upcycled_metrics["renewals"], orig_metrics["renewals"], alpha=0.15, color='#16a34a')
-    ax1.set_title('(a) Effective Depth Renewal Profile (1 - CKA)', fontweight='bold')
-    ax1.set_xlabel('Transformer Layer Index')
-    ax1.set_ylabel('Representation Renewal')
-    ax1.grid(True)
-    ax1.legend()
+    ax1 = axes[0, 0]
+    x_pos = np.arange(len(names))
+    w = 0.27
+    ax1.bar(x_pos - w, [results[n]["logic_bpb"] for n in names], width=w, label="Logic BPB", color="#2563eb")
+    ax1.bar(x_pos, [results[n]["code_bpb"] for n in names], width=w, label="Coding BPB", color="#16a34a")
+    ax1.bar(x_pos + w, [results[n]["overall_bpb"] for n in names], width=w, label="Overall BPB", color="#dc2626")
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels(names, rotation=28, ha="right", fontsize=8)
+    ax1.set_ylabel("Bits-Per-Byte (Lower is Better)")
+    ax1.set_title("Panel 1: Held-Out Logic & Coding BPB Comparison", fontsize=11, fontweight="bold")
+    ax1.grid(True, axis="y", linestyle=":", alpha=0.6)
+    ax1.legend(fontsize=8)
 
-    if upcycled_metrics.get("has_moe"):
-        ent = upcycled_metrics["layer_entropies"]
-        ax2.plot(range(1, len(ent) + 1), ent, '*-', color='#7c3aed', label=f'OS-MoE Routing Entropy (H={upcycled_metrics["mean_entropy"]:.2f})')
-        ax2.axhline(np.log(8), color='#475569', linestyle=':', label='Theoretical Max ln(8)=2.08')
-        ax2.set_title('(b) Routing Entropy Across MoE Layers', fontweight='bold')
-        ax2.set_xlabel('MoE Layer Index')
-        ax2.set_ylabel('Entropy (nats)')
-        ax2.set_ylim(0.5, 2.3)
-        ax2.grid(True)
-        ax2.legend()
-    else:
-        ax2.text(0.5, 0.5, 'MoE Router Active in Upcycled Variant', ha='center', va='center')
+    ax2 = axes[0, 1]
+    for n, c in zip(names, colors):
+        hist = results[n].get("train_loss_curve", [])
+        if hist:
+            steps = [pt[0] for pt in hist]
+            vals = [pt[1] for pt in hist]
+            ax2.plot(steps, vals, label=n, color=c, linewidth=2.0, alpha=0.9)
+    ax2.set_title("Panel 2: Training Convergence (AdamW vs GEO-Muon)", fontsize=11, fontweight="bold")
+    ax2.set_xlabel("Optimization Step")
+    ax2.set_ylabel("Training LM Loss")
+    ax2.grid(True, linestyle=":", alpha=0.6)
+    ax2.legend(fontsize=7.5, loc="best")
 
-    cond_orig = orig_metrics.get("mean_condition_number", 45.0)
-    cond_up = upcycled_metrics.get("mean_condition_number", 1.0)
-    bars = ax3.bar(['Original Qwen (AdamW)', 'Upcycled Qwen (GEO-Muon)'], [cond_orig, cond_up], color=['#f97316', '#dc2626'])
-    ax3.set_title('(c) Weight Update Condition Number kappa', fontweight='bold')
-    ax3.set_ylabel('Condition Number kappa (Lower is Better)')
-    ax3.grid(True, axis='y')
-    for b in bars:
-        h = b.get_height()
-        ax3.text(b.get_x() + b.get_width() / 2, h + 1, f'{h:.1f}', ha='center', fontweight='bold')
+    ax3 = axes[0, 2]
+    for n, c in zip(names, colors):
+        curve = results[n].get("conflict_curve", [])
+        if curve:
+            ax3.plot(np.linspace(0, 100, len(curve)), curve, label=n, color=c, linewidth=1.8, alpha=0.85)
+    ax3.set_title("Panel 3 (GOR): Residual Conflict Rate R_conflict(l)", fontsize=11, fontweight="bold")
+    ax3.set_xlabel("Normalized Depth (%)")
+    ax3.set_ylabel("Destructive Conflict (%)")
+    ax3.grid(True, linestyle=":", alpha=0.6)
+    ax3.legend(fontsize=7, loc="best")
 
-    active_orig = 490.0
-    active_up = 280.0
-    ax4.scatter([active_orig], [0.218], color='#3b82f6', marker='s', s=120, label='Original Qwen-2.5-0.5B Dense')
-    ax4.scatter([active_up], [0.205], color='#7c3aed', marker='*', s=260, label='Qwen-2.5-OS-MoE-0.5B (Active -43% FLOPs)')
-    ax4.scatter([2400.0], [0.162], color='#ec4899', marker='D', s=100, label='DeepSeek-V2-Lite (2.4B Active)')
-    ax4.scatter([2800.0], [0.158], color='#ec4899', marker='D', s=120, label='DeepSeekMoE-16B (2.8B Active)')
-    ax4.set_xscale('log')
-    ax4.set_title('(d) Active Parameters vs. Loss (Pareto Frontier)', fontweight='bold')
-    ax4.set_xlabel('Active Parameters per Token (Millions, Log-Scale)')
-    ax4.set_ylabel('Loss / Perplexity Proxy')
-    ax4.grid(True, which="both", ls="--")
-    ax4.legend(fontsize=8)
+    ax4 = axes[1, 0]
+    for n, c in zip(names, colors):
+        curve = results[n].get("erank_curve", [])
+        if curve:
+            ax4.plot(np.linspace(0, 100, len(curve)), curve, label=n, color=c, linewidth=1.8, alpha=0.85)
+    ax4.set_title("Panel 4 (GOR): Token-Normalized Effective Rank Ratio", fontsize=11, fontweight="bold")
+    ax4.set_xlabel("Normalized Depth (%)")
+    ax4.set_ylabel("erank_norm / min(T, d)")
+    ax4.grid(True, linestyle=":", alpha=0.6)
+    ax4.legend(fontsize=7, loc="best")
 
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
-    plt.close()
+    ax5 = axes[1, 1]
+    for n, c in zip(names, colors):
+        curve = results[n].get("srank_curve", [])
+        if curve:
+            ax5.plot(np.linspace(0, 100, len(curve)), curve, label=n, color=c, linewidth=1.8, alpha=0.85)
+    ax5.set_title("Panel 5 (GEO-Muon): Weight Stable Rank Ratio srank(W)", fontsize=11, fontweight="bold")
+    ax5.set_xlabel("Normalized Depth (%)")
+    ax5.set_ylabel("srank(W_l)")
+    ax5.grid(True, linestyle=":", alpha=0.6)
+    ax5.legend(fontsize=7, loc="best")
+
+    ax6 = axes[1, 2]
+    for idx, (n, c) in enumerate(zip(names, colors)):
+        r = results[n]
+        marker = "s" if r.get("is_moe") else "o"
+        ax6.scatter(r["active_params_b"], r["overall_bpb"], color=c, s=130, marker=marker, edgecolors="black", zorder=5)
+        dy = 12 if idx % 2 == 0 else -18
+        ax6.annotate(
+            f"{n}\n({r['overall_bpb']:.4f} BPB)",
+            (r["active_params_b"], r["overall_bpb"]),
+            textcoords="offset points",
+            xytext=(8, dy),
+            fontsize=7.5,
+            fontweight="bold",
+            color=c,
+            arrowprops=dict(arrowstyle="-", color=c, lw=0.7, alpha=0.6),
+        )
+    ax6.set_title("Panel 6 (Pareto): Active Params vs Overall Logic+Code BPB", fontsize=11, fontweight="bold")
+    ax6.set_xlabel("Active Parameters per Token (Billions)")
+    ax6.set_ylabel("Held-Out Overall BPB (Lower is Better)")
+    ax6.grid(True, linestyle=":", alpha=0.6)
+
+    fig.savefig(output_png_path, format="png", bbox_inches="tight")
+    buf = BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    plot_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    ranked = sorted(results.items(), key=lambda kv: kv[1]["overall_bpb"])
+    winner_name, winner_res = ranked[0]
+
+    rows_html = []
+    for rank, (m_name, r) in enumerate(ranked, 1):
+        bg = "#f0fdf4" if rank == 1 else "#ffffff"
+        moe_str = f"{r['avg_moe_entropy_pct']}% / {r['avg_moe_ortho_defect']}" if r["is_moe"] else "—"
+        vio_str = f"{r['max_vio_global']} / {r['max_lse']}" if r["is_moe"] else "—"
+        rows_html.append(
+            f"<tr style='background:{bg}; border-bottom:1px solid #e2e8f0;'>"
+            f"<td style='padding:8px; font-weight:bold;'>#{rank}</td>"
+            f"<td style='padding:8px; text-align:left; font-weight:bold;'>{m_name}</td>"
+            f"<td style='padding:8px;'>{r['total_params_b']}B / {r['active_params_b']}B</td>"
+            f"<td style='padding:8px; font-weight:bold; color:#0f766e;'>{r['overall_bpb']}</td>"
+            f"<td style='padding:8px;'>{r['logic_bpb']} ({r['logic_ppl']})</td>"
+            f"<td style='padding:8px;'>{r['code_bpb']} ({r['code_ppl']})</td>"
+            f"<td style='padding:8px;'>{r['avg_conflict_pct']}% / {r['avg_ortho_energy_pct']}%</td>"
+            f"<td style='padding:8px;'>{r['avg_erank_norm']}</td>"
+            f"<td style='padding:8px;'>{r['avg_bi']} / {r['avg_cka_renewal']}</td>"
+            f"<td style='padding:8px;'>{r['avg_srank_w']}</td>"
+            f"<td style='padding:8px;'>{moe_str}</td>"
+            f"<td style='padding:8px;'>{vio_str}</td>"
+            f"<td style='padding:8px;'>{r.get('peak_vram_gb', 0.0)} GB</td>"
+            f"<td style='padding:8px;'>{r['throughput_tok_s']}</td>"
+            f"</tr>"
+        )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Qwen-2.5-3B Alba Ablation Report (GOR, OS-MoE, GEO-Muon vs AdamW)</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:#f8fafc; color:#0f172a; padding:24px; }}
+.container {{ max-width:1420px; margin:0 auto; background:#fff; padding:28px; border-radius:12px; border:1px solid #e2e8f0; }}
+h1 {{ border-bottom:2px solid #2563eb; padding-bottom:10px; font-size:24px; }}
+table {{ width:100%; border-collapse:collapse; font-size:12px; text-align:center; margin-top:16px; }}
+th {{ background:#f1f5f9; padding:10px 6px; border-bottom:2px solid #cbd5e1; }}
+.winner {{ background:#f0fdf4; border-left:4px solid #16a34a; padding:14px; margin:16px 0; border-radius:0 8px 8px 0; }}
+.fig {{ text-align:center; margin-top:24px; }}
+.fig img {{ max-width:100%; border:1px solid #cbd5e1; border-radius:8px; }}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Qwen-2.5-3B Alba Ablation Study: GOR × OS-MoE × (AdamW vs GEO-Muon)</h1>
+<div class="winner">
+<strong>Top Ranked Model on Held-Out Logic + Coding Evaluation:</strong> {winner_name} — Overall BPB: <strong>{winner_res['overall_bpb']}</strong> (Logic BPB: {winner_res['logic_bpb']}, Coding BPB: {winner_res['code_bpb']}, Active Params: {winner_res['active_params_b']}B).
+</div>
+<table>
+<thead>
+<tr>
+<th>Rank</th>
+<th style="text-align:left;">Variant</th>
+<th>Total / Active</th>
+<th>Overall BPB</th>
+<th>Logic BPB (PPL)</th>
+<th>Coding BPB (PPL)</th>
+<th>Conflict / Ortho</th>
+<th>Avg erank_norm</th>
+<th>Avg BI / 1-CKA</th>
+<th>Avg srank(W)</th>
+<th>MoE H_route / D_ortho</th>
+<th>MaxVio / Max LSE</th>
+<th>Peak VRAM</th>
+<th>Tok/s</th>
+</tr>
+</thead>
+<tbody>
+{''.join(rows_html)}
+</tbody>
+</table>
+<div class="fig">
+<img src="data:image/png;base64,{plot_b64}" alt="Qwen-2.5-3B Ablation 6-Panel Grid">
+</div>
+</div>
+</body>
+</html>
+"""
+    with open(output_html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return output_html_path
