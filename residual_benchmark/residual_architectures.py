@@ -8,6 +8,7 @@ import torch.nn.functional as F
 ALL_ARCHITECTURES = (
     "pre_norm",
     "gor",
+    "gor_bounded",
     "mhc",
     "attn_res_block",
     "attn_res_full",
@@ -43,10 +44,17 @@ class SwiGLULayer(nn.Module):
 
 
 class GeometricOrthogonalResidual(nn.Module):
-    def __init__(self, eps: float = 1e-7, k: float = 3.0):
+    def __init__(self, eps: float = 1e-7, k: float = 3.0, max_phi: Optional[float] = None):
         super().__init__()
         self.eps = eps
         self.k = k
+        self.max_phi = max_phi
+
+    def _compute_phi(self, rho: torch.Tensor) -> torch.Tensor:
+        phi = 2.0 * torch.sigmoid(self.k * rho)
+        if self.max_phi is not None:
+            phi = torch.clamp(phi, max=self.max_phi)
+        return phi
 
     def forward(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
         orig_dtype = x.dtype
@@ -64,7 +72,7 @@ class GeometricOrthogonalResidual(nn.Module):
         u_parallel = (dot / (norm_sq_x + self.eps)) * xf
         u_perp = uf - u_parallel
 
-        phi = 2.0 * torch.sigmoid(self.k * rho)
+        phi = self._compute_phi(rho)
         out = xf + u_perp + phi * u_parallel
         return out.to(dtype=orig_dtype)
 
@@ -86,7 +94,7 @@ class GeometricOrthogonalResidual(nn.Module):
         u_parallel = (dot / (norm_sq_x + self.eps)) * xf
         u_perp = uf - u_parallel
 
-        phi = 2.0 * torch.sigmoid(self.k * rho)
+        phi = self._compute_phi(rho)
         out = xf + u_perp + phi * u_parallel
         return out.to(dtype=orig_dtype), float(rho.detach().mean().item()), float(phi.detach().mean().item())
 
@@ -208,10 +216,14 @@ class GORResidualNetwork(BaseResidualNetwork):
         init_std: Optional[float] = None,
         gor_k: float = 3.0,
         gor_eps: float = 1e-7,
+        gor_max_phi: Optional[float] = None,
     ):
         super().__init__(dim=dim, num_layers=num_layers, hidden_dim=hidden_dim, init_std=init_std)
         self.gor_ops = nn.ModuleList(
-            [GeometricOrthogonalResidual(eps=gor_eps, k=gor_k) for _ in range(num_layers)]
+            [
+                GeometricOrthogonalResidual(eps=gor_eps, k=gor_k, max_phi=gor_max_phi)
+                for _ in range(num_layers)
+            ]
         )
 
     def forward(
@@ -257,6 +269,30 @@ class GORResidualNetwork(BaseResidualNetwork):
         if return_stats:
             return out, stats
         return out
+
+
+class BoundedGORResidualNetwork(GORResidualNetwork):
+    arch_name = "gor_bounded"
+
+    def __init__(
+        self,
+        dim: int,
+        num_layers: int,
+        hidden_dim: Optional[int] = None,
+        init_std: Optional[float] = None,
+        gor_k: float = 3.0,
+        gor_eps: float = 1e-7,
+        gor_max_phi: float = 1.0,
+    ):
+        super().__init__(
+            dim=dim,
+            num_layers=num_layers,
+            hidden_dim=hidden_dim,
+            init_std=init_std,
+            gor_k=gor_k,
+            gor_eps=gor_eps,
+            gor_max_phi=gor_max_phi,
+        )
 
 
 class MHCLayerCoupling(nn.Module):
@@ -668,6 +704,15 @@ def build_residual_network(
             hidden_dim=hidden_dim,
             init_std=init_std,
             gor_k=gor_k,
+        )
+    if arch == "gor_bounded":
+        return BoundedGORResidualNetwork(
+            dim=dim,
+            num_layers=num_layers,
+            hidden_dim=hidden_dim,
+            init_std=init_std,
+            gor_k=gor_k,
+            gor_max_phi=1.0,
         )
     if arch == "mhc":
         return MHCResidualNetwork(

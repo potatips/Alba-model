@@ -1,6 +1,7 @@
 from .residual_architectures import (
     ALL_ARCHITECTURES,
     AttnResNetwork,
+    BoundedGORResidualNetwork,
     GatedResidualNetwork,
     GeometricOrthogonalResidual,
     GORResidualNetwork,
@@ -21,6 +22,7 @@ __all__ = [
     "sinkhorn_knopp",
     "PreNormResidualNetwork",
     "GORResidualNetwork",
+    "BoundedGORResidualNetwork",
     "MHCResidualNetwork",
     "AttnResNetwork",
     "GatedResidualNetwork",

@@ -63,6 +63,52 @@ class TestResidualBenchmark(unittest.TestCase):
         net = build_residual_network("gor", dim=32, num_layers=4)
         self.assertEqual(net.count_residual_overhead_params(), 0)
 
+    def test_bounded_gor_identities_and_no_positive_overshoot(self):
+        gor = GeometricOrthogonalResidual(eps=1e-7, k=3.0)
+        bounded = GeometricOrthogonalResidual(eps=1e-7, k=3.0, max_phi=1.0)
+
+        x = torch.tensor([[3.0, 4.0, 0.0, 0.0]])
+        u_orth = torch.tensor([[0.0, 0.0, 2.0, -1.0]])
+        self.assertLess((bounded(x, u_orth) - (x + u_orth)).abs().max().item(), 1e-5)
+
+        u_pos = 0.5 * x
+        out_pos, rho_pos, phi_pos = bounded.forward_with_metrics(x, u_pos)
+        self.assertLess((out_pos - (x + u_pos)).abs().max().item(), 1e-5)
+        self.assertGreater(rho_pos, 0.99)
+        self.assertLessEqual(phi_pos, 1.0 + 1e-6)
+
+        u_neg = -0.5 * x
+        self.assertLess((bounded(x, u_neg) - gor(x, u_neg)).abs().max().item(), 1e-6)
+
+        gen_init = torch.Generator().manual_seed(123)
+        x0 = torch.randn(4, 4, 32, generator=gen_init)
+        for rho in [0.8, -0.8]:
+            x_pre = x0.clone()
+            x_gor = x0.clone()
+            x_bnd = x0.clone()
+            g_pre = torch.Generator().manual_seed(999)
+            g_gor = torch.Generator().manual_seed(999)
+            g_bnd = torch.Generator().manual_seed(999)
+            for _ in range(32):
+                u_pre = generate_controlled_alignment_step(x_pre, target_rho=rho, update_scale=0.15, generator=g_pre)
+                u_gor = generate_controlled_alignment_step(x_gor, target_rho=rho, update_scale=0.15, generator=g_gor)
+                u_bnd = generate_controlled_alignment_step(x_bnd, target_rho=rho, update_scale=0.15, generator=g_bnd)
+                x_pre = x_pre + u_pre
+                x_gor = gor(x_gor, u_gor)
+                x_bnd = bounded(x_bnd, u_bnd)
+            if rho > 0:
+                rel_diff = (x_bnd - x_pre).abs().max().item() / max(x_pre.abs().max().item(), 1e-12)
+                self.assertLess(rel_diff, 1e-4)
+                self.assertLess(x_bnd.norm().item(), x_gor.norm().item() * 0.1)
+            else:
+                rel_diff = (x_bnd - x_gor).abs().max().item() / max(x_gor.abs().max().item(), 1e-12)
+                self.assertLess(rel_diff, 1e-4)
+                self.assertGreater(x_bnd.norm().item(), x_pre.norm().item() * 10.0)
+
+        net = build_residual_network("gor_bounded", dim=32, num_layers=4)
+        self.assertEqual(net.count_residual_overhead_params(), 0)
+        self.assertEqual(net.arch_name, "gor_bounded")
+
     def test_sinkhorn_birkhoff_polytope_invariants(self):
         torch.manual_seed(11)
         for scale in [0.1, 1.0]:

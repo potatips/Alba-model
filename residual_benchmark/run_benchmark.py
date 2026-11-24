@@ -36,6 +36,7 @@ from .synthetic_data import (
 ARCH_LABELS = {
     "pre_norm": "Pre-Norm (Baseline)",
     "gor": "GOR (0-Param)",
+    "gor_bounded": "Bounded GOR (phi<=1, 0-Param)",
     "mhc": "mHC (Birkhoff n=4)",
     "attn_res_block": "Block AttnRes (N=8)",
     "attn_res_full": "Full AttnRes",
@@ -45,6 +46,7 @@ ARCH_LABELS = {
 ARCH_COLORS = {
     "pre_norm": (0.28, 0.34, 0.42),
     "gor": (0.85, 0.22, 0.18),
+    "gor_bounded": (0.00, 0.62, 0.58),
     "mhc": (0.12, 0.47, 0.71),
     "attn_res_block": (0.17, 0.63, 0.17),
     "attn_res_full": (0.58, 0.40, 0.74),
@@ -105,6 +107,7 @@ def run_controlled_alignment_experiment(
     rhos = [-0.8, -0.4, 0.0, 0.4, 0.8]
     update_scale = 0.15
     gor_op = GeometricOrthogonalResidual(eps=1e-7, k=3.0).to(device)
+    gor_bounded_op = GeometricOrthogonalResidual(eps=1e-7, k=3.0, max_phi=1.0).to(device)
     results: Dict[str, Dict[str, Dict[str, float]]] = {}
 
     for depth in depths:
@@ -117,8 +120,10 @@ def run_controlled_alignment_experiment(
 
             x_pre = x0.clone()
             x_gor = x0.clone()
+            x_gor_b = x0.clone()
             gen_pre = torch.Generator(device=device).manual_seed(seed + 1000)
             gen_gor = torch.Generator(device=device).manual_seed(seed + 1000)
+            gen_gor_b = torch.Generator(device=device).manual_seed(seed + 1000)
 
             with torch.no_grad():
                 for _ in range(depth):
@@ -128,23 +133,33 @@ def run_controlled_alignment_experiment(
                     u_gor = generate_controlled_alignment_step(
                         x_gor, target_rho=rho, update_scale=update_scale, generator=gen_gor
                     )
+                    u_gor_b = generate_controlled_alignment_step(
+                        x_gor_b, target_rho=rho, update_scale=update_scale, generator=gen_gor_b
+                    )
                     x_pre = x_pre + u_pre
                     x_gor = gor_op(x_gor, u_gor)
+                    x_gor_b = gor_bounded_op(x_gor_b, u_gor_b)
 
             pre_ratio = float(torch.linalg.vector_norm(x_pre, dim=-1).mean().item() / max(x0_norm, 1e-12))
             gor_ratio = float(torch.linalg.vector_norm(x_gor, dim=-1).mean().item() / max(x0_norm, 1e-12))
+            gor_b_ratio = float(torch.linalg.vector_norm(x_gor_b, dim=-1).mean().item() / max(x0_norm, 1e-12))
             pre_cos = float(F.cosine_similarity(x_pre, x0, dim=-1).mean().item())
             gor_cos = float(F.cosine_similarity(x_gor, x0, dim=-1).mean().item())
+            gor_b_cos = float(F.cosine_similarity(x_gor_b, x0, dim=-1).mean().item())
             pre_erank = normalized_erank(x_pre)
             gor_erank = normalized_erank(x_gor)
+            gor_b_erank = normalized_erank(x_gor_b)
 
             results[depth_key][f"{rho:+.1f}"] = {
                 "pre_norm_ratio": pre_ratio,
                 "gor_norm_ratio": gor_ratio,
+                "gor_bounded_norm_ratio": gor_b_ratio,
                 "pre_cos_to_x0": pre_cos,
                 "gor_cos_to_x0": gor_cos,
+                "gor_bounded_cos_to_x0": gor_b_cos,
                 "pre_erank": pre_erank,
                 "gor_erank": gor_erank,
+                "gor_bounded_erank": gor_b_erank,
             }
     return {"update_scale": update_scale, "depths": results}
 
@@ -469,8 +484,8 @@ def run_depth_data_scaling_grid(
 def render_benchmark_figure(results: Dict[str, object], output_png: str) -> None:
     fig, axes = plt.subplots(2, 4, figsize=(24, 11))
     fig.suptitle(
-        "Synthetic Random Matrix Benchmark: Pre-Norm vs GOR vs mHC vs AttnRes vs Gated Residual (2026)",
-        fontsize=15,
+        "Synthetic Random Matrix Benchmark: Pre-Norm vs GOR vs Bounded GOR vs mHC vs AttnRes vs Gated Residual (2026)",
+        fontsize=14,
         fontweight="bold",
     )
 
@@ -537,11 +552,12 @@ def render_benchmark_figure(results: Dict[str, object], output_png: str) -> None
     rho_vals = [float(k) for k in rho_keys]
     pre_norms = [max(rows[k]["pre_norm_ratio"], 1e-6) for k in rho_keys]
     gor_norms = [max(rows[k]["gor_norm_ratio"], 1e-6) for k in rho_keys]
+    gor_b_norms = [max(rows[k]["gor_bounded_norm_ratio"], 1e-6) for k in rho_keys]
     ax.plot(
         rho_vals,
         pre_norms,
         marker="o",
-        linewidth=2.2,
+        linewidth=2.6,
         color=ARCH_COLORS["pre_norm"],
         label="Pre-Norm",
     )
@@ -552,6 +568,15 @@ def render_benchmark_figure(results: Dict[str, object], output_png: str) -> None
         linewidth=2.2,
         color=ARCH_COLORS["gor"],
         label="GOR (0-Param)",
+    )
+    ax.plot(
+        rho_vals,
+        gor_b_norms,
+        marker="^",
+        linestyle="--",
+        linewidth=2.4,
+        color=ARCH_COLORS["gor_bounded"],
+        label="Bounded GOR (phi<=1)",
     )
     ax.axhline(1.0, linestyle="--", color="gray", linewidth=1.0, alpha=0.7)
     ax.set_yscale("log")
@@ -619,10 +644,11 @@ def render_benchmark_figure(results: Dict[str, object], output_png: str) -> None
     grid = results["scaling_grid"]
     grid_keys = list(grid.keys())
     x_pos = list(range(len(grid_keys)))
-    width = 0.13
+    n_arch = len(ALL_ARCHITECTURES)
+    width = 0.80 / max(n_arch, 1)
     max_h = 0.0
     for idx, arch in enumerate(ALL_ARCHITECTURES):
-        offsets = [p + (idx - 2.5) * width for p in x_pos]
+        offsets = [p + (idx - (n_arch - 1) / 2.0) * width for p in x_pos]
         heights = [grid[k][arch]["best_val_mse"] for k in grid_keys]
         max_h = max(max_h, max(heights))
         ax.bar(
@@ -636,9 +662,9 @@ def render_benchmark_figure(results: Dict[str, object], output_png: str) -> None
     ax.set_xticks(x_pos)
     ax.set_xticklabels(grid_keys, fontsize=8.5)
     ax.set_ylabel("Best Validation MSE (Lower is Better)")
-    ax.set_ylim(0.0, max_h * 1.35)
+    ax.set_ylim(0.0, max_h * 1.40)
     ax.grid(True, axis="y", alpha=0.3)
-    ax.legend(fontsize=6.8, ncol=2, loc="upper center")
+    ax.legend(fontsize=6.5, ncol=2, loc="upper center")
 
     plt.tight_layout(rect=[0, 0.02, 1, 0.95])
     os.makedirs(os.path.dirname(output_png), exist_ok=True)
@@ -649,7 +675,7 @@ def render_benchmark_figure(results: Dict[str, object], output_png: str) -> None
 def write_markdown_report(results: Dict[str, object], report_path: str) -> None:
     lines: List[str] = []
     meta = results["config"]
-    lines.append("# Benchmark Thực Nghiệm: GOR vs Pre-Norm vs mHC vs AttnRes vs Gated Residual (2026)")
+    lines.append("# Benchmark Thực Nghiệm: Pre-Norm vs GOR vs Bounded GOR vs mHC vs AttnRes vs Gated Residual (2026)")
     lines.append("")
     lines.append(
         f"- Device: `{meta['device']}` | Matrix dim `d={meta['dim']}` | Seq len `T={meta['seq_len']}` | "
@@ -657,20 +683,21 @@ def write_markdown_report(results: Dict[str, object], report_path: str) -> None:
     )
     lines.append("")
 
-    lines.append("## 1. Controlled Cosine-Alignment Stress Test (Pre-Norm vs GOR)")
+    lines.append("## 1. Controlled Cosine-Alignment Stress Test (Pre-Norm vs GOR vs Bounded GOR)")
     lines.append("")
     align = results["controlled_alignment"]["depths"]
     for depth_key, rows in align.items():
         lines.append(f"### Depth L = {depth_key}")
         lines.append(
-            "| Target rho | Pre-Norm ||x_L||/||x_0|| | GOR ||x_L||/||x_0|| | Pre-Norm cos(x_L,x_0) | GOR cos(x_L,x_0) | Pre-Norm eRank | GOR eRank |"
+            "| Target rho | Pre-Norm ||x_L||/||x_0|| | GOR ||x_L||/||x_0|| | Bounded GOR ||x_L||/||x_0|| | Pre-Norm cos(x_L,x_0) | GOR cos(x_L,x_0) | Bounded GOR cos(x_L,x_0) | Pre-Norm eRank | GOR eRank | Bounded GOR eRank |"
         )
-        lines.append("|---|---:|---:|---:|---:|---:|---:|")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for rho_key, vals in rows.items():
             lines.append(
                 f"| `{rho_key}` | {vals['pre_norm_ratio']:.4f} | {vals['gor_norm_ratio']:.4f} | "
-                f"{vals['pre_cos_to_x0']:.4f} | {vals['gor_cos_to_x0']:.4f} | "
-                f"{vals['pre_erank']:.4f} | {vals['gor_erank']:.4f} |"
+                f"{vals['gor_bounded_norm_ratio']:.4f} | {vals['pre_cos_to_x0']:.4f} | "
+                f"{vals['gor_cos_to_x0']:.4f} | {vals['gor_bounded_cos_to_x0']:.4f} | "
+                f"{vals['pre_erank']:.4f} | {vals['gor_erank']:.4f} | {vals['gor_bounded_erank']:.4f} |"
             )
         lines.append("")
 
@@ -757,7 +784,7 @@ def write_markdown_report(results: Dict[str, object], report_path: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Synthetic Random Matrix Benchmark for Residual Architectures (Pre-Norm, GOR, mHC, AttnRes, Gated Residual)"
+        description="Synthetic Random Matrix Benchmark for Residual Architectures (Pre-Norm, GOR, Bounded GOR, mHC, AttnRes, Gated Residual)"
     )
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
     parser.add_argument("--dim", type=int, default=128)
