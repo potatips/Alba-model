@@ -1,17 +1,18 @@
 import inspect
 import math
 import types
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class GeometricOrthogonalResidual(nn.Module):
-    def __init__(self, eps: float = 1e-7, k: float = 3.0):
+    def __init__(self, eps: float = 1e-7, k: float = 3.0, max_phi: Optional[float] = None):
         super().__init__()
         self.eps = eps
         self.k = k
+        self.max_phi = max_phi
 
     def forward(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
         orig_dtype = x.dtype
@@ -30,6 +31,8 @@ class GeometricOrthogonalResidual(nn.Module):
         u_perp = uf - u_parallel
 
         phi = 2.0 * torch.sigmoid(self.k * rho)
+        if self.max_phi is not None:
+            phi = torch.clamp(phi, max=self.max_phi)
         out = xf + u_perp + phi * u_parallel
         return out.to(dtype=orig_dtype)
 
@@ -39,6 +42,7 @@ def _gor_qwen2_decoder_layer_forward(
     hidden_states: torch.Tensor,
     attention_mask=None,
     position_ids=None,
+    past_key_value=None,
     past_key_values=None,
     use_cache=False,
     position_embeddings=None,
@@ -47,15 +51,25 @@ def _gor_qwen2_decoder_layer_forward(
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
 
-    attn_kwargs = {
+    pkv = past_key_values if past_key_values is not None else past_key_value
+    pkv_key = getattr(self, "_gor_attn_pkv_key", "past_key_values")
+    attn_param_names = getattr(self, "_gor_attn_param_names", None)
+    attn_accepts_varkw = getattr(self, "_gor_attn_accepts_varkw", True)
+
+    candidate_kwargs = {
         "hidden_states": hidden_states,
         "attention_mask": attention_mask,
         "position_ids": position_ids,
-        "past_key_values": past_key_values,
+        pkv_key: pkv,
         "use_cache": use_cache,
         "position_embeddings": position_embeddings,
     }
-    attn_kwargs.update(kwargs)
+    candidate_kwargs.update(kwargs)
+
+    if attn_param_names is not None and not attn_accepts_varkw:
+        attn_kwargs = {k: v for k, v in candidate_kwargs.items() if k in attn_param_names}
+    else:
+        attn_kwargs = candidate_kwargs
 
     attn_outputs = self.self_attn(**attn_kwargs)
     if isinstance(attn_outputs, tuple):
@@ -82,17 +96,26 @@ def _gor_qwen2_decoder_layer_forward(
     return hidden_states
 
 
-def apply_gor_to_qwen_layers(model: nn.Module, k: float = 3.0) -> int:
+def apply_gor_to_qwen_layers(model: nn.Module, k: float = 3.0, max_phi: Optional[float] = None) -> int:
     decoder_layers = _locate_decoder_layers(model)
     count = 0
     for layer in decoder_layers:
         if not hasattr(layer, "gor_attn"):
-            layer.gor_attn = GeometricOrthogonalResidual(k=k)
+            layer.gor_attn = GeometricOrthogonalResidual(k=k, max_phi=max_phi)
         if not hasattr(layer, "gor_mlp"):
-            layer.gor_mlp = GeometricOrthogonalResidual(k=k)
+            layer.gor_mlp = GeometricOrthogonalResidual(k=k, max_phi=max_phi)
         sig = inspect.signature(type(layer).forward)
         ret_str = str(sig.return_annotation)
         layer._gor_returns_tuple = "tuple" in ret_str.lower() and "tensor" in ret_str.lower()
+        attn_sig = inspect.signature(layer.self_attn.forward)
+        attn_params = attn_sig.parameters
+        layer._gor_attn_param_names = set(attn_params.keys())
+        layer._gor_attn_accepts_varkw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in attn_params.values()
+        )
+        layer._gor_attn_pkv_key = (
+            "past_key_values" if "past_key_values" in attn_params else "past_key_value"
+        )
         layer.forward = types.MethodType(_gor_qwen2_decoder_layer_forward, layer)
         count += 1
     return count

@@ -14,6 +14,27 @@ from qwen_geo_muon import create_qwen_adamw_optimizer, create_qwen_geomuon_optim
 from qwen_moefication import build_qwen_variant, collect_ortho_loss, count_model_params
 
 
+GOR_ONLY_VARIANTS = [
+    {
+        "name": "Qwen-2.5-3B (Base Untouched)",
+        "enable_gor": False,
+        "enable_moe": False,
+        "optimizer": "none",
+    },
+    {
+        "name": "Qwen-2.5-3B + GOR (AdamW)",
+        "enable_gor": True,
+        "enable_moe": False,
+        "optimizer": "adamw",
+    },
+    {
+        "name": "Qwen-2.5-3B + GOR (GEO-Muon)",
+        "enable_gor": True,
+        "enable_moe": False,
+        "optimizer": "geo_muon",
+    },
+]
+
 ABLATION_VARIANTS = [
     {
         "name": "Qwen-2.5-3B (Base Untouched)",
@@ -267,8 +288,10 @@ def run_qwen3b_ablation_suite(
     output_html_path: str = "qwen3b_ablation_report.html",
     output_png_path: str = "qwen3b_ablation_grid.png",
     save_checkpoint_dir: Optional[str] = None,
+    variants: Optional[List[Dict]] = None,
     seed: int = 42,
 ) -> Dict[str, Dict]:
+    active_variants = variants if variants is not None else ABLATION_VARIANTS
     dataset_payload = build_or_load_logic_code_dataset(
         cache_path=dataset_cache_path,
         n_train_logic=n_train_logic,
@@ -295,7 +318,7 @@ def run_qwen3b_ablation_suite(
         except Exception:
             results = {}
 
-    for cfg in ABLATION_VARIANTS:
+    for cfg in active_variants:
         v_name = cfg["name"]
         if v_name in results and "overall_bpb" in results[v_name]:
             print(f"Skipping already completed variant: {v_name}")
