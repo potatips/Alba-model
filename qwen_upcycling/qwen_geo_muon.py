@@ -160,14 +160,18 @@ def create_qwen_adamw_optimizer(
     model: torch.nn.Module,
     lr: float = 5e-5,
     weight_decay: float = 0.01,
+    graft_lr: float = None,
 ) -> torch.optim.Optimizer:
     decay_params = []
     no_decay_params = []
+    graft_params = []
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.dim() < 2 or "norm" in name or "bias" in name:
+        if graft_lr is not None and "residual_graft." in name:
+            graft_params.append(param)
+        elif param.dim() < 2 or "norm" in name or "bias" in name:
             no_decay_params.append(param)
         else:
             decay_params.append(param)
@@ -176,6 +180,8 @@ def create_qwen_adamw_optimizer(
         {"params": decay_params, "weight_decay": weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
+    if graft_params:
+        param_groups.append({"params": graft_params, "weight_decay": 0.0, "lr": graft_lr})
 
     use_fused = torch.cuda.is_available()
     try:
