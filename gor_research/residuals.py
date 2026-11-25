@@ -14,6 +14,7 @@ ALL_LM_RESIDUALS = (
     "std_dual_bank",
     "dual_bank_gor_v2",
     "gor_v3_subspace",
+    "mhc",
     "attn_res_block",
     "attn_res_gor_v2",
 )
@@ -26,6 +27,7 @@ RESIDUAL_LABELS = {
     "std_dual_bank": "Std Dual-Bank Control",
     "dual_bank_gor_v2": "Dual-Bank + GOR-v2 (phi<=2)",
     "gor_v3_subspace": "GOR-v3 Subspace Contrast",
+    "mhc": "mHC (Sinkhorn n=4)",
     "attn_res_block": "Block AttnRes (N=8)",
     "attn_res_gor_v2": "Block AttnRes + Attn-GOR-v2",
 }
@@ -158,6 +160,7 @@ class ResidualBankState:
     s_fast: Optional[torch.Tensor] = None
     s_slow: Optional[torch.Tensor] = None
     last_read: Optional[torch.Tensor] = None
+    streams: Optional[torch.Tensor] = None
     completed: List[torch.Tensor] = field(default_factory=list)
     completed_keys: List[torch.Tensor] = field(default_factory=list)
     partial: Optional[torch.Tensor] = None
@@ -287,12 +290,11 @@ class BlockAttnResConnector(nn.Module):
     def _attend(self, states: List[torch.Tensor], keys: List[torch.Tensor], query: torch.Tensor) -> torch.Tensor:
         if len(states) == 1:
             return states[0]
-        logits = torch.stack([torch.einsum("d,...d->...", query, k) for k in keys], dim=0)
-        w = F.softmax(logits.float(), dim=0).to(states[0].dtype)
-        out = w[0].unsqueeze(-1) * states[0]
-        for idx in range(1, len(states)):
-            out = out + w[idx].unsqueeze(-1) * states[idx]
-        return out
+        states_t = torch.stack(states, dim=0)
+        keys_t = torch.stack(keys, dim=0)
+        logits = (keys_t.float() * query.float()).sum(dim=-1)
+        w = F.softmax(logits, dim=0).to(dtype=states_t.dtype)
+        return (w.unsqueeze(-1) * states_t).sum(dim=0)
 
     def init_state(self, x0: torch.Tensor) -> ResidualBankState:
         return ResidualBankState(
@@ -341,3 +343,92 @@ class BlockAttnResGORv2Connector(BlockAttnResConnector):
         if sublayer_idx % 2 == 0 and state.last_read is not None:
             u_eff = _gor_v2_transform_u(state.last_read, u, k=self.k, eps=self.eps)
         super().update(state, u_eff, sublayer_idx)
+
+
+def sinkhorn_knopp(logits: torch.Tensor, iters: int = 10, eps: float = 1e-6) -> torch.Tensor:
+    z = logits.float()
+    z = z - z.amax(dim=(-2, -1), keepdim=True)
+    m = torch.exp(z).clamp_min(eps)
+    for _ in range(iters):
+        m = m / (m.sum(dim=-1, keepdim=True) + eps)
+        m = m / (m.sum(dim=-2, keepdim=True) + eps)
+    return m
+
+
+class MHCConnector(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_sublayers: int,
+        n_streams: int = 4,
+        sinkhorn_iters: int = 10,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_sublayers = num_sublayers
+        self.n_streams = n_streams
+        self.sinkhorn_iters = sinkhorn_iters
+        self.eps = eps
+
+        init_res = torch.full((num_sublayers, n_streams, n_streams), -2.0)
+        diag_idx = torch.arange(n_streams)
+        init_res[:, diag_idx, diag_idx] = 4.0
+        self.h_res_bias = nn.Parameter(init_res)
+        self.h_pre_bias = nn.Parameter(torch.zeros(num_sublayers, n_streams))
+        self.h_post_bias = nn.Parameter(torch.zeros(num_sublayers, n_streams))
+
+        self.dyn_norm = RMSNorm(dim)
+        self.alpha_res = nn.Parameter(torch.zeros(num_sublayers))
+        self.alpha_pre = nn.Parameter(torch.zeros(num_sublayers))
+        self.alpha_post = nn.Parameter(torch.zeros(num_sublayers))
+        self.dyn_res = nn.Linear(dim, num_sublayers * n_streams * n_streams, bias=False)
+        self.dyn_pre = nn.Linear(dim, num_sublayers * n_streams, bias=False)
+        self.dyn_post = nn.Linear(dim, num_sublayers * n_streams, bias=False)
+        nn.init.zeros_(self.dyn_res.weight)
+        nn.init.zeros_(self.dyn_pre.weight)
+        nn.init.zeros_(self.dyn_post.weight)
+
+    def init_state(self, x0: torch.Tensor) -> ResidualBankState:
+        streams = x0.unsqueeze(-2).repeat(*([1] * (x0.ndim - 1)), self.n_streams, 1).contiguous()
+        return ResidualBankState(x0=x0, streams=streams)
+
+    def _dyn_weights(self, streams: torch.Tensor, sublayer_idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        n = self.n_streams
+        pooled = self.dyn_norm(streams.mean(dim=-2))
+        s_off = sublayer_idx * n
+        r_off = sublayer_idx * n * n
+
+        pre_w = F.linear(pooled, self.dyn_pre.weight[s_off : s_off + n])
+        post_w = F.linear(pooled, self.dyn_post.weight[s_off : s_off + n])
+        res_w = F.linear(pooled, self.dyn_res.weight[r_off : r_off + n * n]).view(*pooled.shape[:-1], n, n)
+
+        h_pre_logits = self.h_pre_bias[sublayer_idx] + self.alpha_pre[sublayer_idx] * torch.tanh(pre_w.float())
+        h_post_logits = self.h_post_bias[sublayer_idx] + self.alpha_post[sublayer_idx] * torch.tanh(post_w.float())
+        h_res_logits = self.h_res_bias[sublayer_idx] + self.alpha_res[sublayer_idx] * torch.tanh(res_w.float())
+
+        h_pre = F.softmax(h_pre_logits.float(), dim=-1)
+        h_post = 2.0 * torch.sigmoid(h_post_logits.float())
+        h_res = sinkhorn_knopp(h_res_logits, iters=self.sinkhorn_iters, eps=self.eps)
+        return h_pre, h_post, h_res
+
+    def read(self, state: ResidualBankState, sublayer_idx: int) -> torch.Tensor:
+        streams = state.streams
+        h_pre, h_post, h_res = self._dyn_weights(streams, sublayer_idx)
+        state.last_read = (h_post, h_res)
+        h_in = (h_pre.to(dtype=streams.dtype).unsqueeze(-1) * streams).sum(dim=-2)
+        return h_in
+
+    def update(self, state: ResidualBankState, u: torch.Tensor, sublayer_idx: int) -> None:
+        streams = state.streams
+        if state.last_read is None:
+            _, h_post, h_res = self._dyn_weights(streams, sublayer_idx)
+        else:
+            h_post, h_res = state.last_read
+            state.last_read = None
+        mixed = torch.matmul(h_res.to(dtype=streams.dtype), streams)
+        injected = h_post.to(dtype=u.dtype).unsqueeze(-1) * u.unsqueeze(-2)
+        state.streams = mixed + injected
+
+    def finalize(self, state: ResidualBankState) -> torch.Tensor:
+        return state.streams.mean(dim=-2)

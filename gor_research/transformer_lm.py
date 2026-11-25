@@ -13,6 +13,7 @@ from .residuals import (
     GORBoundedResidual,
     GORv2Residual,
     GORv3SubspaceConnector,
+    MHCConnector,
     PreNormResidual,
     RMSNorm,
     StdDualBankConnector,
@@ -31,6 +32,8 @@ class TransformerConfig:
     residual_type: str = "pre_norm"
     gor_k: float = 3.0
     attn_num_blocks: int = 8
+    mhc_streams: int = 4
+    gradient_checkpointing: bool = False
 
 
 def precompute_rope_freqs(head_dim: int, max_seq_len: int, theta: float = 10000.0) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -96,6 +99,25 @@ class TransformerSublayerBlock(nn.Module):
         self.ffn_norm = RMSNorm(config.dim)
         self.ffn = SwiGLU(config.dim, config.hidden_dim)
 
+    def forward_attention(self, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        return self.attn(self.attn_norm(h), cos, sin)
+
+    def forward_ffn(self, h: torch.Tensor) -> torch.Tensor:
+        return self.ffn(self.ffn_norm(h))
+
+
+def _effective_rank_norm(x: torch.Tensor) -> float:
+    xf = x.detach().float()
+    xf = xf - xf.mean(dim=0, keepdim=True)
+    s = torch.linalg.svdvals(xf)
+    s = s[s > 1e-7]
+    if s.numel() <= 1:
+        return 0.0
+    p = s / s.sum()
+    ent = -(p * torch.log(p)).sum()
+    max_rank = max(min(xf.size(0), xf.size(1)), 2)
+    return float(torch.clamp(torch.exp(ent) / float(max_rank), 0.0, 1.0).item())
+
 
 def _linear_cka(x: torch.Tensor, y: torch.Tensor) -> float:
     xf = x.detach().float()
@@ -144,6 +166,9 @@ class FromScratchTransformerLM(nn.Module):
         elif config.residual_type == "gor_v3_subspace":
             self.res_op = None
             self.connector = GORv3SubspaceConnector(config.dim, num_sublayers=num_sublayers, k=config.gor_k)
+        elif config.residual_type == "mhc":
+            self.res_op = None
+            self.connector = MHCConnector(config.dim, num_sublayers=num_sublayers, n_streams=config.mhc_streams)
         elif config.residual_type == "attn_res_block":
             self.res_op = None
             self.connector = BlockAttnResConnector(
@@ -179,6 +204,16 @@ class FromScratchTransformerLM(nn.Module):
             return 0
         return sum(p.numel() for p in self.connector.parameters() if p.requires_grad)
 
+    def _run_attn(self, layer: TransformerSublayerBlock, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        if self.config.gradient_checkpointing and self.training:
+            return torch.utils.checkpoint.checkpoint(layer.forward_attention, h, cos, sin, use_reentrant=False)
+        return layer.forward_attention(h, cos, sin)
+
+    def _run_ffn(self, layer: TransformerSublayerBlock, h: torch.Tensor) -> torch.Tensor:
+        if self.config.gradient_checkpointing and self.training:
+            return torch.utils.checkpoint.checkpoint(layer.forward_ffn, h, use_reentrant=False)
+        return layer.forward_ffn(h)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -197,6 +232,7 @@ class FromScratchTransformerLM(nn.Module):
                 "norm_growth": [],
                 "dilution_ratios": [],
                 "depth_renewal": [],
+                "erank_norm": [],
             }
             x0_norm_val = float(torch.linalg.vector_norm(x.detach().float(), dim=-1).mean().item())
             prev_h = x.detach().float().reshape(-1, self.config.dim)
@@ -205,14 +241,14 @@ class FromScratchTransformerLM(nn.Module):
             h = x
             x0_norm = torch.sqrt((x.float() * x.float()).sum(dim=-1, keepdim=True) + 1e-7)
             for layer in self.layers:
-                u_attn = layer.attn(layer.attn_norm(h), cos, sin)
+                u_attn = self._run_attn(layer, h, cos, sin)
                 h_next = self.res_op(h, u_attn, x0_norm=x0_norm)
                 if collect_geometry:
                     self._record_sublayer_geom(geom, h, u_attn, h_next, x0_norm_val, prev_h)
                     prev_h = h_next.detach().float().reshape(-1, self.config.dim)
                 h = h_next
 
-                u_ffn = layer.ffn(layer.ffn_norm(h))
+                u_ffn = self._run_ffn(layer, h)
                 h_next = self.res_op(h, u_ffn, x0_norm=x0_norm)
                 if collect_geometry:
                     self._record_sublayer_geom(geom, h, u_ffn, h_next, x0_norm_val, prev_h)
@@ -224,19 +260,19 @@ class FromScratchTransformerLM(nn.Module):
             for layer_idx, layer in enumerate(self.layers):
                 sub_attn = 2 * layer_idx
                 h_attn = self.connector.read(state, sub_attn)
-                u_attn = layer.attn(layer.attn_norm(h_attn), cos, sin)
+                u_attn = self._run_attn(layer, h_attn, cos, sin)
                 self.connector.update(state, u_attn, sub_attn)
                 if collect_geometry:
-                    cur = state.s_fast if state.s_fast is not None else (state.partial if state.partial is not None else state.completed[-1])
+                    cur = self._state_repr(state)
                     self._record_sublayer_geom(geom, h_attn, u_attn, cur, x0_norm_val, prev_h)
                     prev_h = cur.detach().float().reshape(-1, self.config.dim)
 
                 sub_ffn = 2 * layer_idx + 1
                 h_ffn = self.connector.read(state, sub_ffn)
-                u_ffn = layer.ffn(layer.ffn_norm(h_ffn))
+                u_ffn = self._run_ffn(layer, h_ffn)
                 self.connector.update(state, u_ffn, sub_ffn)
                 if collect_geometry:
-                    cur = state.s_fast if state.s_fast is not None else (state.partial if state.partial is not None else state.completed[-1])
+                    cur = self._state_repr(state)
                     self._record_sublayer_geom(geom, h_ffn, u_ffn, cur, x0_norm_val, prev_h)
                     prev_h = cur.detach().float().reshape(-1, self.config.dim)
             out_h = self.connector.finalize(state)
@@ -246,6 +282,15 @@ class FromScratchTransformerLM(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
         return logits, loss, geom
+
+    def _state_repr(self, state) -> torch.Tensor:
+        if state.streams is not None:
+            return state.streams.mean(dim=-2)
+        if state.s_fast is not None:
+            return state.s_fast
+        if state.partial is not None:
+            return state.partial
+        return state.completed[-1]
 
     def _record_sublayer_geom(
         self,
@@ -268,6 +313,7 @@ class FromScratchTransformerLM(nn.Module):
         cur_flat = h_next.detach().float().reshape(-1, self.config.dim)
         n_rows = min(512, cur_flat.size(0))
         geom["depth_renewal"].append(1.0 - _linear_cka(prev_h_flat[:n_rows], cur_flat[:n_rows]))
+        geom["erank_norm"].append(_effective_rank_norm(cur_flat[:n_rows]))
 
 
 def clone_transformer_backbone(source: FromScratchTransformerLM, target: FromScratchTransformerLM) -> None:
