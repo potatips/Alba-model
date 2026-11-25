@@ -13,7 +13,9 @@ class ModelArgs:
     n_heads: int = 8              # Số attention heads (H), mỗi head d_h = 512 / 8 = 64
     max_seq_len: int = 256        # Độ dài ngữ cảnh tối đa một lần đưa vào (T)
     dropout: float = 0.0          # Dropout
-    residual_type: str = "gor"    # Cơ chế Residual: 'gor' (Geometric Orthogonal Residual) hoặc 'standard' (x + u)
+    residual_type: str = "gor"    # Cơ chế Residual: 'gor'/'gor_v2', 'standard'/'pre_norm', 'std_dual_bank', 'dual_bank_gor_v2', 'attn_res_block', 'attn_res_gor_v2'
+    gor_k: float = 3.0            # Độ dốc cổng GOR-v2: phi = 2 * sigmoid(gor_k * rho)
+    attn_num_blocks: int = 8      # Số block tối đa cho Block AttnRes / AttnRes+GOR-v2
     ffn_type: str = "swiglu"      # Khối FFN: 'swiglu' (Dense LLaMA chuẩn) hoặc 'os_moe' (Orthogonal Sub-Expert MoE)
     n_routed_experts: int = 8     # Tổng số Sub-Experts trong khối MoE
     num_experts_per_tok: int = 2  # Số Sub-Experts kích hoạt cho mỗi token (Top-K)

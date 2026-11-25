@@ -12,6 +12,13 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from .config import ModelArgs
+from gor_research.residuals import (
+    BlockAttnResConnector,
+    BlockAttnResGORv2Connector,
+    DualBankGORv2Connector,
+    StdDualBankConnector,
+    _gor_v2_residual_add,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -181,7 +188,7 @@ class OrthogonalSubMoE(nn.Module):
                 t_idx = token_indices[expert_mask]
                 w = flat_topk_weights[expert_mask]
                 out_e = self.sub_experts[e_idx](x_flat[t_idx])
-                routed_out.index_add_(0, t_idx, out_e * w)
+                routed_out.index_add_(0, t_idx, (out_e * w).to(routed_out.dtype))
                     
         total_out = shared_out + routed_out.view(B, T, C)
         
@@ -219,34 +226,44 @@ class GeometricOrthogonalResidual(nn.Module):
         self.k = k
 
     def forward(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, d), u: (B, T, d)
-        dot = (x * u).sum(dim=-1, keepdim=True)
-        norm_sq_x = (x * x).sum(dim=-1, keepdim=True)
-        norm_sq_u = (u * u).sum(dim=-1, keepdim=True)
-        
-        norm_x = torch.sqrt(norm_sq_x + self.eps)
-        norm_u = torch.sqrt(norm_sq_u + self.eps)
-        
-        # Góc tương quan cosin rho trong khoảng [-1, 1]
-        rho = dot / (norm_x * norm_u + self.eps)
-        
-        # Phân rã trực giao Gram-Schmidt
-        u_parallel = (dot / (norm_sq_x + self.eps)) * x
-        u_perp = u - u_parallel
-        
-        # GOR-v2: Điều biến trơn C^infinity bảo toàn Identity tại rho=0
-        phi = 2.0 * torch.sigmoid(self.k * rho)
-        
-        return x + u_perp + phi * u_parallel
+        return _gor_v2_residual_add(x, u, k=self.k, eps=self.eps)
+
+
+def _normalize_residual_type(residual_type: str) -> str:
+    aliases = {
+        "standard": "pre_norm",
+        "gor": "gor_v2",
+    }
+    return aliases.get(residual_type, residual_type)
+
+
+def _build_residual_connector(args: ModelArgs):
+    mode = _normalize_residual_type(getattr(args, "residual_type", "gor"))
+    num_sublayers = 2 * args.n_layers
+    gor_k = getattr(args, "gor_k", 3.0)
+    attn_num_blocks = getattr(args, "attn_num_blocks", 8)
+    if mode in ("pre_norm", "gor_v2"):
+        return None
+    if mode == "std_dual_bank":
+        return StdDualBankConnector(args.dim, num_sublayers=num_sublayers)
+    if mode == "dual_bank_gor_v2":
+        return DualBankGORv2Connector(args.dim, num_sublayers=num_sublayers, k=gor_k)
+    if mode == "attn_res_block":
+        return BlockAttnResConnector(args.dim, num_sublayers=num_sublayers, num_blocks=attn_num_blocks)
+    if mode == "attn_res_gor_v2":
+        return BlockAttnResGORv2Connector(
+            args.dim, num_sublayers=num_sublayers, num_blocks=attn_num_blocks, k=gor_k
+        )
+    raise ValueError(f"Unsupported residual_type: {args.residual_type}")
 
 
 # -----------------------------------------------------------------------------
-# 6. Transformer Block (Hỗ trợ GOR, Standard Residual, SwiGLU và OS-MoE)
+# 6. Transformer Block (Hỗ trợ GOR-v2, Standard Residual, DualBank, AttnRes+GOR-v2, SwiGLU và OS-MoE)
 # -----------------------------------------------------------------------------
 class TransformerBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.residual_type = getattr(args, "residual_type", "gor")
+        self.residual_mode = _normalize_residual_type(getattr(args, "residual_type", "gor"))
         self.ffn_type = getattr(args, "ffn_type", "swiglu")
         self.attention_norm = RMSNorm(args.dim)
         self.attention = CausalSelfAttention(args)
@@ -261,24 +278,28 @@ class TransformerBlock(nn.Module):
         else:
             self.feed_forward = SwiGLU(args.dim)
 
-        if self.residual_type == "gor":
-            self.res_attn = GeometricOrthogonalResidual()
-            self.res_ffn = GeometricOrthogonalResidual()
+        if self.residual_mode == "gor_v2":
+            gor_k = getattr(args, "gor_k", 3.0)
+            self.res_attn = GeometricOrthogonalResidual(k=gor_k)
+            self.res_ffn = GeometricOrthogonalResidual(k=gor_k)
+
+    def forward_attention(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        return self.attention(self.attention_norm(x), freqs_cis)
+
+    def forward_ffn(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        norm_h = self.ffn_norm(h)
+        if self.ffn_type == "os_moe":
+            return self.feed_forward(norm_h)
+        return self.feed_forward(norm_h), torch.zeros((), device=h.device, dtype=h.dtype)
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # Nhánh 1: Multi-Head Attention
-        u_attn = self.attention(self.attention_norm(x), freqs_cis)
-        h = self.res_attn(x, u_attn) if self.residual_type == "gor" else x + u_attn
+        u_attn = self.forward_attention(x, freqs_cis)
+        h = self.res_attn(x, u_attn) if self.residual_mode == "gor_v2" else x + u_attn
 
         # Nhánh 2: Feed-Forward (SwiGLU hoặc OrthogonalSubMoE)
-        aux_loss = torch.tensor(0.0, device=x.device)
-        norm_h = self.ffn_norm(h)
-        if self.ffn_type == "os_moe":
-            u_ffn, aux_loss = self.feed_forward(norm_h)
-        else:
-            u_ffn = self.feed_forward(norm_h)
-
-        out = self.res_ffn(h, u_ffn) if self.residual_type == "gor" else h + u_ffn
+        u_ffn, aux_loss = self.forward_ffn(h)
+        out = self.res_ffn(h, u_ffn) if self.residual_mode == "gor_v2" else h + u_ffn
 
         return out, aux_loss
 
@@ -292,6 +313,7 @@ class MiniLLM(nn.Module):
         self.args = args
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
         self.layers = nn.ModuleList([TransformerBlock(args) for _ in range(args.n_layers)])
+        self.res_connector = _build_residual_connector(args)
         self.norm = RMSNorm(args.dim)
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         
@@ -318,11 +340,26 @@ class MiniLLM(nn.Module):
         h = self.tok_embeddings(idx)
         freqs_cis = self.freqs_cis[:T]
         
-        total_aux_loss = torch.tensor(0.0, device=idx.device)
-        # Đi qua từng tầng Transformer
-        for layer in self.layers:
-            h, layer_aux = layer(h, freqs_cis)
-            total_aux_loss = total_aux_loss + layer_aux
+        total_aux_loss = torch.zeros((), device=idx.device, dtype=h.dtype)
+        if self.res_connector is None:
+            for layer in self.layers:
+                h, layer_aux = layer(h, freqs_cis)
+                total_aux_loss = total_aux_loss + layer_aux
+        else:
+            state = self.res_connector.init_state(h)
+            sublayer_idx = 0
+            for layer in self.layers:
+                attn_in = self.res_connector.read(state, sublayer_idx)
+                u_attn = layer.forward_attention(attn_in, freqs_cis)
+                self.res_connector.update(state, u_attn, sublayer_idx)
+                sublayer_idx += 1
+
+                ffn_in = self.res_connector.read(state, sublayer_idx)
+                u_ffn, layer_aux = layer.forward_ffn(ffn_in)
+                self.res_connector.update(state, u_ffn, sublayer_idx)
+                total_aux_loss = total_aux_loss + layer_aux
+                sublayer_idx += 1
+            h = self.res_connector.finalize(state)
             
         h = self.norm(h)
         logits = self.output(h)
@@ -330,7 +367,7 @@ class MiniLLM(nn.Module):
         loss = None
         if targets is not None:
             # Cross-Entropy Loss: dự đoán token tiếp theo
-            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            ce_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
             moe_coeff = getattr(self.args, "moe_ortho_coeff", 0.01) if getattr(self.args, "ffn_type", "swiglu") == "os_moe" else 0.0
             loss = ce_loss + moe_coeff * total_aux_loss
             

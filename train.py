@@ -45,7 +45,15 @@ def parse_args():
     parser.add_argument("--dim", type=int, default=512, help="Số chiều vector embedding (d_model)")
     parser.add_argument("--n_layers", type=int, default=8, help="Số tầng Transformer (L)")
     parser.add_argument("--n_heads", type=int, default=8, help="Số attention heads (H)")
-    parser.add_argument("--residual_type", type=str, default="gor", choices=["gor", "standard"], help="Cơ chế Residual: gor (Geometric Orthogonal Residual) hoặc standard (x + u)")
+    parser.add_argument(
+        "--residual_type",
+        type=str,
+        default="gor",
+        choices=["gor", "gor_v2", "standard", "pre_norm", "std_dual_bank", "dual_bank_gor_v2", "attn_res_block", "attn_res_gor_v2"],
+        help="Cơ chế Residual",
+    )
+    parser.add_argument("--gor_k", type=float, default=3.0, help="Độ dốc cổng GOR-v2 (mặc định 3.0)")
+    parser.add_argument("--attn_num_blocks", type=int, default=8, help="Số block cho AttnRes / AttnRes+GOR-v2")
     parser.add_argument("--ffn_type", type=str, default="swiglu", choices=["swiglu", "os_moe"], help="Khối FFN: swiglu (Dense chuẩn) hoặc os_moe (Orthogonal Sub-Expert MoE)")
     parser.add_argument("--n_experts", type=int, default=8, help="Số Sub-Experts cho OS-MoE")
     parser.add_argument("--top_k", type=int, default=2, help="Số Sub-Experts kích hoạt trên mỗi token (Top-K)")
@@ -216,9 +224,11 @@ def main():
         dim=args.dim,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
-        max_seq_len=256,
+        max_seq_len=max(256, args.seq_len),
         dropout=0.0,
         residual_type=args.residual_type,
+        gor_k=args.gor_k,
+        attn_num_blocks=args.attn_num_blocks,
         ffn_type=args.ffn_type,
         n_routed_experts=args.n_experts,
         num_experts_per_tok=args.top_k,
@@ -252,7 +262,7 @@ def main():
     print("🚀 BẮT ĐẦU HUẤN LUYỆN ĐA GIAI ĐOẠN")
     print(f"   - Thí nghiệm: {args.exp_name}")
     print(f"   - Kiến trúc FFN: {args.ffn_type.upper()} ({f'OS-MoE ({args.n_experts} experts, top-{args.top_k})' if args.ffn_type == 'os_moe' else 'Dense SwiGLU'})")
-    print(f"   - Kiến trúc Residual: {args.residual_type.upper()} ({'Geometric Orthogonal Residual v2 (GOR-v2)' if args.residual_type == 'gor' else 'Standard Residual (x + u)'})")
+    print(f"   - Kiến trúc Residual: {args.residual_type.upper()}")
     print(f"   - Bộ tối ưu: {opt_choice.upper()}")
     print(f"   - Giai đoạn 1 (Nền tảng): Bước 1 ➔ {phase1_iters} (80%)")
     print(f"   - Giai đoạn 2 (Annealing): Bước {phase1_iters + 1} ➔ {args.max_iters} (20%)")
