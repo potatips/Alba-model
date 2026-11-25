@@ -203,3 +203,103 @@ def get_eval_texts(dataset_payload: Dict) -> Tuple[List[str], List[str]]:
     logic_texts = [r["text"] for r in dataset_payload["eval_logic"]]
     code_texts = [r["text"] for r in dataset_payload["eval_code"]]
     return logic_texts, code_texts
+
+
+def _format_mmlu_ood(row: Dict) -> str:
+    letters = ["A", "B", "C", "D"]
+    choices = row.get("choices") or []
+    opts = "\n".join(f"({letters[idx]}) {txt}" for idx, txt in enumerate(choices[:4]))
+    ans_idx = int(row.get("answer", 0))
+    ans_letter = letters[ans_idx] if 0 <= ans_idx < len(letters) else "A"
+    ans_text = choices[ans_idx] if 0 <= ans_idx < len(choices) else ""
+    subj = str(row.get("subject") or "logic").replace("_", " ")
+    return (
+        f"Subject: {subj}\n"
+        f"Question: {row['question'].strip()}\n"
+        f"{opts}\n"
+        f"Answer: ({ans_letter}) {ans_text}"
+    )
+
+
+def build_or_load_ood_eval_dataset(
+    cache_path: str = "qwen_ood_eval_dataset.json",
+    n_ood_logic: int = 80,
+    n_ood_code: int = 80,
+    n_ood_general: int = 80,
+    seed: int = 42,
+) -> Dict[str, List[Dict[str, str]]]:
+    if os.path.exists(cache_path):
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if (
+            len(data.get("ood_logic", [])) >= n_ood_logic
+            and len(data.get("ood_code", [])) >= n_ood_code
+            and len(data.get("ood_general", [])) >= n_ood_general
+        ):
+            return data
+
+    rng = random.Random(seed + 1000)
+
+    mmlu_logic = load_dataset("cais/mmlu", "formal_logic", split="test")
+    mmlu_math = load_dataset("cais/mmlu", "high_school_mathematics", split="test")
+    humaneval = load_dataset("openai/openai_humaneval", split="test")
+    wikitext = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+
+    n_fl = min(n_ood_logic // 2, len(mmlu_logic))
+    n_hm = min(n_ood_logic - n_fl, len(mmlu_math))
+    ood_logic = [
+        {"domain": "ood_logic", "source": "mmlu_formal_logic", "text": _format_mmlu_ood(mmlu_logic[i])}
+        for i in rng.sample(range(len(mmlu_logic)), n_fl)
+    ] + [
+        {"domain": "ood_logic", "source": "mmlu_hs_math", "text": _format_mmlu_ood(mmlu_math[i])}
+        for i in rng.sample(range(len(mmlu_math)), n_hm)
+    ]
+
+    n_he = min(n_ood_code, len(humaneval))
+    ood_code = [
+        {
+            "domain": "ood_code",
+            "source": "humaneval",
+            "text": f"{humaneval[i]['prompt']}{humaneval[i]['canonical_solution']}",
+        }
+        for i in rng.sample(range(len(humaneval)), n_he)
+    ]
+
+    wiki_candidates = [
+        r["text"].strip()
+        for r in wikitext
+        if len(r["text"].strip()) >= 160 and not r["text"].strip().startswith("=")
+    ]
+    n_wk = min(n_ood_general, len(wiki_candidates))
+    ood_general = [
+        {"domain": "ood_general", "source": "wikitext2", "text": wiki_candidates[i]}
+        for i in rng.sample(range(len(wiki_candidates)), n_wk)
+    ]
+
+    payload = {
+        "meta": {
+            "seed": seed + 1000,
+            "n_ood_logic": len(ood_logic),
+            "n_ood_code": len(ood_code),
+            "n_ood_general": len(ood_general),
+        },
+        "ood_logic": ood_logic,
+        "ood_code": ood_code,
+        "ood_general": ood_general,
+    }
+
+    parent = os.path.dirname(os.path.abspath(cache_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    return payload
+
+
+def get_ood_eval_texts(ood_payload: Dict) -> Dict[str, List[str]]:
+    return {
+        "ood_logic": [r["text"] for r in ood_payload.get("ood_logic", [])],
+        "ood_code": [r["text"] for r in ood_payload.get("ood_code", [])],
+        "ood_general": [r["text"] for r in ood_payload.get("ood_general", [])],
+    }

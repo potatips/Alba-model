@@ -2,7 +2,7 @@ import base64
 import math
 import time
 from io import BytesIO
-from typing import Dict, List
+from typing import Dict, List, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -250,6 +250,7 @@ def evaluate_qwen_variant_full(
     tokenizer,
     eval_logic_texts: List[str],
     eval_code_texts: List[str],
+    ood_eval_texts: Optional[Dict[str, List[str]]] = None,
     max_length: int = 512,
     eval_batch_size: int = 4,
     device: str = "cuda",
@@ -260,6 +261,24 @@ def evaluate_qwen_variant_full(
     overall_bpb = round(0.5 * (logic_res["bpb"] + code_res["bpb"]), 4)
     overall_loss = round(0.5 * (logic_res["loss"] + code_res["loss"]), 4)
     overall_ppl = round(float(math.exp(min(overall_loss, 20.0))), 3)
+
+    ood_metrics = {}
+    if ood_eval_texts:
+        ood_bpbs = []
+        ood_losses = []
+        for key, texts in ood_eval_texts.items():
+            if texts:
+                res = evaluate_domain_bpb(model, tokenizer, texts, max_length=max_length, batch_size=eval_batch_size, device=device)
+                ood_metrics[f"{key}_bpb"] = res["bpb"]
+                ood_metrics[f"{key}_ppl"] = res["ppl"]
+                ood_metrics[f"{key}_loss"] = res["loss"]
+                ood_bpbs.append(res["bpb"])
+                ood_losses.append(res["loss"])
+        if ood_bpbs:
+            ood_mean_loss = round(float(np.mean(ood_losses)), 4)
+            ood_metrics["ood_bpb"] = round(float(np.mean(ood_bpbs)), 4)
+            ood_metrics["ood_loss"] = ood_mean_loss
+            ood_metrics["ood_ppl"] = round(float(math.exp(min(ood_mean_loss, 20.0))), 3)
 
     geom = evaluate_residual_and_moe_geometry(
         model,
@@ -279,6 +298,7 @@ def evaluate_qwen_variant_full(
         "logic_ppl": logic_res["ppl"],
         "code_bpb": code_res["bpb"],
         "code_ppl": code_res["ppl"],
+        **ood_metrics,
         **geom,
     }
 
@@ -288,22 +308,33 @@ def generate_ablation_html_report(
     output_html_path: str = "qwen3b_ablation_report.html",
     output_png_path: str = "qwen3b_ablation_grid.png",
 ) -> str:
-    fig, axes = plt.subplots(2, 3, figsize=(21, 12), dpi=150)
-    plt.subplots_adjust(hspace=0.36, wspace=0.26)
+    fig, axes = plt.subplots(2, 3, figsize=(22, 12.5), dpi=150)
+    plt.subplots_adjust(hspace=0.40, wspace=0.26)
 
     names = list(results.keys())
     colors = plt.cm.tab10(np.linspace(0, 0.9, max(len(names), 1)))
+    has_ood = all("ood_bpb" in results[n] for n in names) if names else False
+    active_vals = [results[n]["active_params_b"] for n in names] if names else [0.0]
+    dense_only = (max(active_vals) - min(active_vals)) < 0.05
 
     ax1 = axes[0, 0]
     x_pos = np.arange(len(names))
-    w = 0.27
-    ax1.bar(x_pos - w, [results[n]["logic_bpb"] for n in names], width=w, label="Logic BPB", color="#2563eb")
-    ax1.bar(x_pos, [results[n]["code_bpb"] for n in names], width=w, label="Coding BPB", color="#16a34a")
-    ax1.bar(x_pos + w, [results[n]["overall_bpb"] for n in names], width=w, label="Overall BPB", color="#dc2626")
+    if has_ood:
+        w = 0.20
+        ax1.bar(x_pos - 1.5 * w, [results[n]["logic_bpb"] for n in names], width=w, label="In-Dist Logic BPB", color="#2563eb")
+        ax1.bar(x_pos - 0.5 * w, [results[n]["code_bpb"] for n in names], width=w, label="In-Dist Coding BPB", color="#16a34a")
+        ax1.bar(x_pos + 0.5 * w, [results[n]["overall_bpb"] for n in names], width=w, label="In-Dist Overall BPB", color="#dc2626")
+        ax1.bar(x_pos + 1.5 * w, [results[n]["ood_bpb"] for n in names], width=w, label="OOD External BPB", color="#9333ea")
+        ax1.set_title("Panel 1: In-Dist vs External OOD BPB (Lower is Better)", fontsize=11, fontweight="bold")
+    else:
+        w = 0.27
+        ax1.bar(x_pos - w, [results[n]["logic_bpb"] for n in names], width=w, label="Logic BPB", color="#2563eb")
+        ax1.bar(x_pos, [results[n]["code_bpb"] for n in names], width=w, label="Coding BPB", color="#16a34a")
+        ax1.bar(x_pos + w, [results[n]["overall_bpb"] for n in names], width=w, label="Overall BPB", color="#dc2626")
+        ax1.set_title("Panel 1: Held-Out Logic & Coding BPB Comparison", fontsize=11, fontweight="bold")
     ax1.set_xticks(x_pos)
-    ax1.set_xticklabels(names, rotation=28, ha="right", fontsize=8)
+    ax1.set_xticklabels(names, rotation=24, ha="right", fontsize=8)
     ax1.set_ylabel("Bits-Per-Byte (Lower is Better)")
-    ax1.set_title("Panel 1: Held-Out Logic & Coding BPB Comparison", fontsize=11, fontweight="bold")
     ax1.grid(True, axis="y", linestyle=":", alpha=0.6)
     ax1.legend(fontsize=8)
 
@@ -314,7 +345,7 @@ def generate_ablation_html_report(
             steps = [pt[0] for pt in hist]
             vals = [pt[1] for pt in hist]
             ax2.plot(steps, vals, label=n, color=c, linewidth=2.0, alpha=0.9)
-    ax2.set_title("Panel 2: Training Convergence (AdamW vs GEO-Muon)", fontsize=11, fontweight="bold")
+    ax2.set_title("Panel 2: Training Convergence (Baseline vs GOR)", fontsize=11, fontweight="bold")
     ax2.set_xlabel("Optimization Step")
     ax2.set_ylabel("Training LM Loss")
     ax2.grid(True, linestyle=":", alpha=0.6)
@@ -354,24 +385,44 @@ def generate_ablation_html_report(
     ax5.legend(fontsize=7, loc="best")
 
     ax6 = axes[1, 2]
-    for idx, (n, c) in enumerate(zip(names, colors)):
-        r = results[n]
-        marker = "s" if r.get("is_moe") else "o"
-        ax6.scatter(r["active_params_b"], r["overall_bpb"], color=c, s=130, marker=marker, edgecolors="black", zorder=5)
-        dy = 12 if idx % 2 == 0 else -18
-        ax6.annotate(
-            f"{n}\n({r['overall_bpb']:.4f} BPB)",
-            (r["active_params_b"], r["overall_bpb"]),
-            textcoords="offset points",
-            xytext=(8, dy),
-            fontsize=7.5,
-            fontweight="bold",
-            color=c,
-            arrowprops=dict(arrowstyle="-", color=c, lw=0.7, alpha=0.6),
-        )
-    ax6.set_title("Panel 6 (Pareto): Active Params vs Overall Logic+Code BPB", fontsize=11, fontweight="bold")
-    ax6.set_xlabel("Active Parameters per Token (Billions)")
-    ax6.set_ylabel("Held-Out Overall BPB (Lower is Better)")
+    if has_ood and dense_only:
+        for idx, (n, c) in enumerate(zip(names, colors)):
+            r = results[n]
+            ax6.scatter(r["overall_bpb"], r["ood_bpb"], color=c, s=130, marker="o", edgecolors="black", zorder=5)
+            dx = 8 if idx % 2 == 0 else -12
+            dy = 10 if idx % 3 == 0 else -14
+            ax6.annotate(
+                f"{n}\n({r['overall_bpb']:.4f}, {r['ood_bpb']:.4f})",
+                (r["overall_bpb"], r["ood_bpb"]),
+                textcoords="offset points",
+                xytext=(dx, dy),
+                fontsize=7.2,
+                fontweight="bold",
+                color=c,
+                arrowprops=dict(arrowstyle="-", color=c, lw=0.7, alpha=0.6),
+            )
+        ax6.set_title("Panel 6: In-Dist vs OOD Generalization (Bottom-Left Best)", fontsize=11, fontweight="bold")
+        ax6.set_xlabel("In-Distribution Overall BPB (Lower is Better)")
+        ax6.set_ylabel("External OOD Overall BPB (Lower is Better)")
+    else:
+        for idx, (n, c) in enumerate(zip(names, colors)):
+            r = results[n]
+            marker = "s" if r.get("is_moe") else "o"
+            ax6.scatter(r["active_params_b"], r["overall_bpb"], color=c, s=130, marker=marker, edgecolors="black", zorder=5)
+            dy = 12 if idx % 2 == 0 else -18
+            ax6.annotate(
+                f"{n}\n({r['overall_bpb']:.4f} BPB)",
+                (r["active_params_b"], r["overall_bpb"]),
+                textcoords="offset points",
+                xytext=(8, dy),
+                fontsize=7.5,
+                fontweight="bold",
+                color=c,
+                arrowprops=dict(arrowstyle="-", color=c, lw=0.7, alpha=0.6),
+            )
+        ax6.set_title("Panel 6 (Pareto): Active Params vs Overall Logic+Code BPB", fontsize=11, fontweight="bold")
+        ax6.set_xlabel("Active Parameters per Token (Billions)")
+        ax6.set_ylabel("Held-Out Overall BPB (Lower is Better)")
     ax6.grid(True, linestyle=":", alpha=0.6)
 
     fig.savefig(output_png_path, format="png", bbox_inches="tight")
@@ -388,6 +439,12 @@ def generate_ablation_html_report(
         bg = "#f0fdf4" if rank == 1 else "#ffffff"
         moe_str = f"{r['avg_moe_entropy_pct']}% / {r['avg_moe_ortho_defect']}" if r["is_moe"] else "—"
         vio_str = f"{r['max_vio_global']} / {r['max_lse']}" if r["is_moe"] else "—"
+        ood_cell = ""
+        if has_ood:
+            ood_cell = (
+                f"<td style='padding:8px; font-weight:bold; color:#7e22ce;'>{r['ood_bpb']}</td>"
+                f"<td style='padding:8px;'>{r.get('ood_logic_bpb', '—')} / {r.get('ood_code_bpb', '—')} / {r.get('ood_general_bpb', '—')}</td>"
+            )
         rows_html.append(
             f"<tr style='background:{bg}; border-bottom:1px solid #e2e8f0;'>"
             f"<td style='padding:8px; font-weight:bold;'>#{rank}</td>"
@@ -396,6 +453,7 @@ def generate_ablation_html_report(
             f"<td style='padding:8px; font-weight:bold; color:#0f766e;'>{r['overall_bpb']}</td>"
             f"<td style='padding:8px;'>{r['logic_bpb']} ({r['logic_ppl']})</td>"
             f"<td style='padding:8px;'>{r['code_bpb']} ({r['code_ppl']})</td>"
+            f"{ood_cell}"
             f"<td style='padding:8px;'>{r['avg_conflict_pct']}% / {r['avg_ortho_energy_pct']}%</td>"
             f"<td style='padding:8px;'>{r['avg_erank_norm']}</td>"
             f"<td style='padding:8px;'>{r['avg_bi']} / {r['avg_cka_renewal']}</td>"
@@ -407,6 +465,12 @@ def generate_ablation_html_report(
             f"</tr>"
         )
 
+    ood_headers = ""
+    winner_ood_note = ""
+    if has_ood:
+        ood_headers = "<th>OOD BPB</th><th>OOD (MMLU / HumanEval / Wiki)</th>"
+        winner_ood_note = f", External OOD BPB: <strong>{winner_res['ood_bpb']}</strong>"
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -414,7 +478,7 @@ def generate_ablation_html_report(
 <title>Qwen-2.5-3B Alba Ablation Report (GOR, OS-MoE, GEO-Muon vs AdamW)</title>
 <style>
 body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:#f8fafc; color:#0f172a; padding:24px; }}
-.container {{ max-width:1420px; margin:0 auto; background:#fff; padding:28px; border-radius:12px; border:1px solid #e2e8f0; }}
+.container {{ max-width:1460px; margin:0 auto; background:#fff; padding:28px; border-radius:12px; border:1px solid #e2e8f0; }}
 h1 {{ border-bottom:2px solid #2563eb; padding-bottom:10px; font-size:24px; }}
 table {{ width:100%; border-collapse:collapse; font-size:12px; text-align:center; margin-top:16px; }}
 th {{ background:#f1f5f9; padding:10px 6px; border-bottom:2px solid #cbd5e1; }}
@@ -425,9 +489,9 @@ th {{ background:#f1f5f9; padding:10px 6px; border-bottom:2px solid #cbd5e1; }}
 </head>
 <body>
 <div class="container">
-<h1>Qwen-2.5-3B Alba Ablation Study: GOR × OS-MoE × (AdamW vs GEO-Muon)</h1>
+<h1>Qwen-2.5-3B Alba Ablation Study: Baseline vs GOR × (AdamW vs GEO-Muon)</h1>
 <div class="winner">
-<strong>Top Ranked Model on Held-Out Logic + Coding Evaluation:</strong> {winner_name} — Overall BPB: <strong>{winner_res['overall_bpb']}</strong> (Logic BPB: {winner_res['logic_bpb']}, Coding BPB: {winner_res['code_bpb']}, Active Params: {winner_res['active_params_b']}B).
+<strong>Top Ranked Model on Held-Out Logic + Coding Evaluation:</strong> {winner_name} — Overall BPB: <strong>{winner_res['overall_bpb']}</strong> (Logic BPB: {winner_res['logic_bpb']}, Coding BPB: {winner_res['code_bpb']}{winner_ood_note}, Active Params: {winner_res['active_params_b']}B).
 </div>
 <table>
 <thead>
@@ -438,6 +502,7 @@ th {{ background:#f1f5f9; padding:10px 6px; border-bottom:2px solid #cbd5e1; }}
 <th>Overall BPB</th>
 <th>Logic BPB (PPL)</th>
 <th>Coding BPB (PPL)</th>
+{ood_headers}
 <th>Conflict / Ortho</th>
 <th>Avg erank_norm</th>
 <th>Avg BI / 1-CKA</th>

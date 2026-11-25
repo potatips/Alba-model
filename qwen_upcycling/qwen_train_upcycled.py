@@ -8,10 +8,50 @@ from typing import Dict, List, Optional
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from qwen_dataset import CausalTextDataset, build_or_load_logic_code_dataset, get_eval_texts
+from qwen_dataset import (
+    CausalTextDataset,
+    build_or_load_logic_code_dataset,
+    build_or_load_ood_eval_dataset,
+    get_eval_texts,
+    get_ood_eval_texts,
+)
 from qwen_eval_metrics import evaluate_qwen_variant_full, generate_ablation_html_report
 from qwen_geo_muon import create_qwen_adamw_optimizer, create_qwen_geomuon_optimizer
 from qwen_moefication import build_qwen_variant, collect_ortho_loss, count_model_params
+
+
+GOR_VS_BASELINE_VARIANTS = [
+    {
+        "name": "Qwen-2.5-3B (Base Untouched)",
+        "enable_gor": False,
+        "enable_moe": False,
+        "optimizer": "none",
+    },
+    {
+        "name": "Qwen-2.5-3B (Baseline AdamW)",
+        "enable_gor": False,
+        "enable_moe": False,
+        "optimizer": "adamw",
+    },
+    {
+        "name": "Qwen-2.5-3B (Baseline GEO-Muon)",
+        "enable_gor": False,
+        "enable_moe": False,
+        "optimizer": "geo_muon",
+    },
+    {
+        "name": "Qwen-2.5-3B + GOR (AdamW)",
+        "enable_gor": True,
+        "enable_moe": False,
+        "optimizer": "adamw",
+    },
+    {
+        "name": "Qwen-2.5-3B + GOR (GEO-Muon)",
+        "enable_gor": True,
+        "enable_moe": False,
+        "optimizer": "geo_muon",
+    },
+]
 
 
 GOR_ONLY_VARIANTS = [
@@ -115,6 +155,7 @@ def train_single_variant(
     train_dataset: CausalTextDataset,
     eval_logic_texts: List[str],
     eval_code_texts: List[str],
+    ood_eval_texts: Optional[Dict[str, List[str]]] = None,
     total_steps: int = 200,
     micro_batch_size: int = 2,
     grad_accum_steps: int = 8,
@@ -240,6 +281,7 @@ def train_single_variant(
         tokenizer=tokenizer,
         eval_logic_texts=eval_logic_texts,
         eval_code_texts=eval_code_texts,
+        ood_eval_texts=ood_eval_texts,
         max_length=512,
         eval_batch_size=4,
         device=device,
@@ -255,9 +297,10 @@ def train_single_variant(
     eval_metrics["enable_moe"] = variant_cfg["enable_moe"]
     eval_metrics["optimizer"] = opt_type
 
+    ood_summary = f" | OOD BPB: {eval_metrics['ood_bpb']}" if "ood_bpb" in eval_metrics else ""
     print(
         f"Finished {v_name} in {elapsed_sec}s | Overall BPB: {eval_metrics['overall_bpb']} "
-        f"(Logic: {eval_metrics['logic_bpb']}, Code: {eval_metrics['code_bpb']}) | "
+        f"(Logic: {eval_metrics['logic_bpb']}, Code: {eval_metrics['code_bpb']}){ood_summary} | "
         f"Conflict: {eval_metrics['avg_conflict_pct']}% | Peak VRAM: {peak_vram} GB"
     )
 
@@ -284,6 +327,9 @@ def run_qwen3b_ablation_suite(
     ortho_weight: float = 0.01,
     moe_mode: str = "lite",
     dataset_cache_path: str = "qwen_logic_code_dataset.json",
+    ood_cache_path: str = "qwen_ood_eval_dataset.json",
+    n_ood_per_domain: int = 80,
+    eval_ood: bool = True,
     results_cache_path: str = "qwen3b_ablation_results.json",
     output_html_path: str = "qwen3b_ablation_report.html",
     output_png_path: str = "qwen3b_ablation_grid.png",
@@ -301,6 +347,18 @@ def run_qwen3b_ablation_suite(
         seed=seed,
     )
     print(f"Dataset ready: {dataset_payload['meta']}")
+
+    ood_eval_texts = None
+    if eval_ood:
+        ood_payload = build_or_load_ood_eval_dataset(
+            cache_path=ood_cache_path,
+            n_ood_logic=n_ood_per_domain,
+            n_ood_code=n_ood_per_domain,
+            n_ood_general=n_ood_per_domain,
+            seed=seed,
+        )
+        ood_eval_texts = get_ood_eval_texts(ood_payload)
+        print(f"OOD Eval Dataset ready: {ood_payload['meta']}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=False)
     if tokenizer.pad_token is None:
@@ -320,7 +378,10 @@ def run_qwen3b_ablation_suite(
 
     for cfg in active_variants:
         v_name = cfg["name"]
-        if v_name in results and "overall_bpb" in results[v_name]:
+        has_required = v_name in results and "overall_bpb" in results[v_name]
+        if eval_ood:
+            has_required = has_required and "ood_bpb" in results[v_name]
+        if has_required:
             print(f"Skipping already completed variant: {v_name}")
             continue
 
@@ -331,6 +392,7 @@ def run_qwen3b_ablation_suite(
             train_dataset=train_dataset,
             eval_logic_texts=eval_logic_texts,
             eval_code_texts=eval_code_texts,
+            ood_eval_texts=ood_eval_texts,
             total_steps=total_steps,
             micro_batch_size=micro_batch_size,
             grad_accum_steps=grad_accum_steps,
