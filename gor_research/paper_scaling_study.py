@@ -313,6 +313,13 @@ def evaluate_downstream(
     return metrics
 
 
+def _save_step_checkpoint(ckpt_path: str, payload: Dict[str, object]) -> None:
+    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+    tmp_path = ckpt_path + ".tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, ckpt_path)
+
+
 def _train_single_run(
     variant: str,
     seed: int,
@@ -324,11 +331,18 @@ def _train_single_run(
     use_compile: bool,
     save_ckpt: bool,
     resume: bool,
+    ckpt_every: int,
+    ckpt_mins: float,
+    max_session_mins: float,
+    max_steps_per_session: int,
+    keep_step_ckpt: bool,
+    session_t0: float,
     output_dir: str,
     device: torch.device,
-) -> Dict[str, object]:
+) -> Optional[Dict[str, object]]:
     steps = int(preset_cfg["steps"])
     run_file = os.path.join(output_dir, "runs", f"{variant}__seed{seed}.json")
+    step_ckpt_file = os.path.join(output_dir, "step_checkpoints", f"{variant}__seed{seed}_latest.pt")
     if resume and os.path.exists(run_file):
         with open(run_file, "r", encoding="utf-8") as f:
             cached = json.load(f)
@@ -337,7 +351,7 @@ def _train_single_run(
             and int(cached.get("dim", -1)) == int(preset_cfg["dim"])
             and int(cached.get("base_layers", -1)) == int(preset_cfg["n_layers"])
         ):
-            print(f"[Resume] Loaded cached result: {variant} (seed={seed})", flush=True)
+            print(f"[Resume] Loaded completed run: {variant} (seed={seed})", flush=True)
             return cached
 
     dim = int(preset_cfg["dim"])
@@ -410,14 +424,9 @@ def _train_single_run(
     hist_val_bpb: List[float] = []
     hist_val_loss: List[float] = []
     hist_grad_norm: List[float] = []
-
-    init_loss, _, init_bpb, _ = evaluate_blocks(
-        base_model, val_blocks, corpus.val_bytes_per_token, device, batch_size, amp_enabled, amp_dtype, max_batches=16
-    )
-    hist_steps.append(0)
-    hist_tokens.append(0)
-    hist_val_loss.append(init_loss)
-    hist_val_bpb.append(init_bpb)
+    start_step = 1
+    total_tokens_seen = 0
+    elapsed_prev = 0.0
 
     total_params = int(base_model.count_total_params())
     emb_params = int(base_model.tok_embeddings.weight.numel())
@@ -425,43 +434,121 @@ def _train_single_run(
     overhead_params = int(base_model.count_residual_overhead_params())
     tokens_per_step = batch_size * grad_accum * seq_len
 
+    resumed_from_ckpt = False
+    if resume and os.path.exists(step_ckpt_file):
+        ckpt = torch.load(step_ckpt_file, map_location="cpu", weights_only=False)
+        if (
+            int(ckpt.get("dim", -1)) == dim
+            and int(ckpt.get("base_layers", -1)) == base_layers
+            and int(ckpt.get("steps", -1)) == steps
+            and str(ckpt.get("variant", "")) == variant
+        ):
+            base_model.load_state_dict(ckpt["model"])
+            opt.load_state_dict(ckpt["optimizer"])
+            sched.load_state_dict(ckpt["scheduler"])
+            if use_scaler and ckpt.get("scaler") is not None:
+                scaler.load_state_dict(ckpt["scaler"])
+            b_gen.set_state(ckpt["b_gen_state"])
+            if ckpt.get("cpu_rng_state") is not None:
+                torch.set_rng_state(ckpt["cpu_rng_state"])
+            if device.type == "cuda" and ckpt.get("cuda_rng_state") is not None:
+                torch.cuda.set_rng_state(ckpt["cuda_rng_state"], device)
+            start_step = int(ckpt["step"]) + 1
+            total_tokens_seen = int(ckpt["total_tokens_seen"])
+            elapsed_prev = float(ckpt["elapsed_prev"])
+            best_val_loss = float(ckpt["best_val_loss"])
+            best_val_bpb = float(ckpt["best_val_bpb"])
+            hist_steps = list(ckpt["hist_steps"])
+            hist_tokens = list(ckpt["hist_tokens"])
+            hist_val_loss = list(ckpt["hist_val_loss"])
+            hist_val_bpb = list(ckpt["hist_val_bpb"])
+            hist_grad_norm = list(ckpt["hist_grad_norm"])
+            resumed_from_ckpt = True
+            print(
+                f"[Resume] Restored {variant} (seed={seed}) at step {start_step - 1}/{steps} "
+                f"({total_tokens_seen / 1e6:.1f}M tok, elapsed={elapsed_prev / 60.0:.1f}m)",
+                flush=True,
+            )
+
+    if not resumed_from_ckpt:
+        init_loss, _, init_bpb, _ = evaluate_blocks(
+            base_model, val_blocks, corpus.val_bytes_per_token, device, batch_size, amp_enabled, amp_dtype, max_batches=16
+        )
+        hist_steps.append(0)
+        hist_tokens.append(0)
+        hist_val_loss.append(init_loss)
+        hist_val_bpb.append(init_bpb)
+        best_val_loss = init_loss
+        best_val_bpb = init_bpb
+
     print(
         f"[Train] {variant:18s} | seed={seed} | L={actual_layers} | d={dim} | "
         f"total={total_params / 1e6:.2f}M (non-emb={non_emb_params / 1e6:.2f}M, res-oh={overhead_params:,}) | "
-        f"steps={steps} (~{steps * tokens_per_step / 1e6:.1f}M tok)",
+        f"steps={start_step}..{steps} (~{steps * tokens_per_step / 1e6:.1f}M tok)",
         flush=True,
     )
 
-    best_val_loss = init_loss
-    best_val_bpb = init_bpb
-    total_tokens_seen = 0
     t0 = time.perf_counter()
+    last_ckpt_time = t0
+    steps_this_session = 0
 
-    for step in range(1, steps + 1):
-        opt.zero_grad(set_to_none=True)
-        for _ in range(grad_accum):
-            batch = train_ds.sample_batch(batch_size, b_gen).to(device, non_blocking=True)
-            xb = batch[:, :-1]
-            yb = batch[:, 1:]
-            total_tokens_seen += int(yb.numel())
-            ctx = torch.amp.autocast(device_type=device.type, dtype=amp_dtype) if amp_enabled else contextlib.nullcontext()
-            with ctx:
-                _, loss, _ = model_fwd(xb, targets=yb)
-                scaled_loss = loss / float(grad_accum)
+    def _build_ckpt_state(cur_step: int) -> Dict[str, object]:
+        return {
+            "variant": variant,
+            "seed": seed,
+            "dim": dim,
+            "base_layers": base_layers,
+            "steps": steps,
+            "step": cur_step,
+            "model": base_model.state_dict(),
+            "optimizer": opt.state_dict(),
+            "scheduler": sched.state_dict(),
+            "scaler": scaler.state_dict() if use_scaler else None,
+            "b_gen_state": b_gen.get_state(),
+            "cpu_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state(device) if device.type == "cuda" else None,
+            "total_tokens_seen": total_tokens_seen,
+            "elapsed_prev": elapsed_prev + (time.perf_counter() - t0),
+            "best_val_loss": best_val_loss,
+            "best_val_bpb": best_val_bpb,
+            "hist_steps": hist_steps,
+            "hist_tokens": hist_tokens,
+            "hist_val_loss": hist_val_loss,
+            "hist_val_bpb": hist_val_bpb,
+            "hist_grad_norm": hist_grad_norm,
+        }
+
+    for step in range(start_step, steps + 1):
+        try:
+            opt.zero_grad(set_to_none=True)
+            for _ in range(grad_accum):
+                batch = train_ds.sample_batch(batch_size, b_gen).to(device, non_blocking=True)
+                xb = batch[:, :-1]
+                yb = batch[:, 1:]
+                total_tokens_seen += int(yb.numel())
+                ctx = torch.amp.autocast(device_type=device.type, dtype=amp_dtype) if amp_enabled else contextlib.nullcontext()
+                with ctx:
+                    _, loss, _ = model_fwd(xb, targets=yb)
+                    scaled_loss = loss / float(grad_accum)
+                if use_scaler:
+                    scaler.scale(scaled_loss).backward()
+                else:
+                    scaled_loss.backward()
+
             if use_scaler:
-                scaler.scale(scaled_loss).backward()
+                scaler.unscale_(opt)
+            gnorm = float(torch.nn.utils.clip_grad_norm_(base_model.parameters(), 1.0).item())
+            if use_scaler:
+                scaler.step(opt)
+                scaler.update()
             else:
-                scaled_loss.backward()
-
-        if use_scaler:
-            scaler.unscale_(opt)
-        gnorm = float(torch.nn.utils.clip_grad_norm_(base_model.parameters(), 1.0).item())
-        if use_scaler:
-            scaler.step(opt)
-            scaler.update()
-        else:
-            opt.step()
-        sched.step()
+                opt.step()
+            sched.step()
+            steps_this_session += 1
+        except KeyboardInterrupt:
+            _save_step_checkpoint(step_ckpt_file, _build_ckpt_state(step - 1))
+            print(f"[Interrupt] Saved checkpoint at step {step - 1}/{steps} -> {step_ckpt_file}", flush=True)
+            return None
 
         if step % eval_every == 0 or step == steps:
             hist_grad_norm.append(gnorm)
@@ -475,19 +562,40 @@ def _train_single_run(
             if vloss < best_val_loss:
                 best_val_loss = vloss
                 best_val_bpb = vbpb
-            elapsed_now = time.perf_counter() - t0
+            elapsed_now = elapsed_prev + (time.perf_counter() - t0)
             print(
                 f"  step {step:5d}/{steps} | tok={total_tokens_seen / 1e6:6.1f}M | "
                 f"val_bpb={vbpb:.4f} | gnorm={gnorm:.2f} | {total_tokens_seen / max(elapsed_now, 1e-6):,.0f} tok/s",
                 flush=True,
             )
 
+        now = time.perf_counter()
+        hit_step_budget = max_steps_per_session > 0 and steps_this_session >= max_steps_per_session and step < steps
+        hit_time_budget = max_session_mins > 0.0 and (now - session_t0) >= (max_session_mins * 60.0) and step < steps
+        need_periodic_ckpt = (
+            (ckpt_every > 0 and step % ckpt_every == 0)
+            or (ckpt_mins > 0.0 and (now - last_ckpt_time) >= (ckpt_mins * 60.0))
+        ) and step < steps
+
+        if hit_step_budget or hit_time_budget:
+            _save_step_checkpoint(step_ckpt_file, _build_ckpt_state(step))
+            print(
+                f"[SessionPause] Saved exact state for {variant} (seed={seed}) at step {step}/{steps} -> {step_ckpt_file}",
+                flush=True,
+            )
+            return None
+
+        if need_periodic_ckpt:
+            _save_step_checkpoint(step_ckpt_file, _build_ckpt_state(step))
+            last_ckpt_time = now
+            print(f"  [Ckpt] Saved step {step}/{steps} -> {step_ckpt_file}", flush=True)
+
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         peak_vram_gb = float(torch.cuda.max_memory_allocated(device) / (1024 ** 3))
     else:
         peak_vram_gb = 0.0
-    elapsed = time.perf_counter() - t0
+    elapsed = elapsed_prev + (time.perf_counter() - t0)
     tok_per_sec = float(total_tokens_seen) / max(elapsed, 1e-6)
 
     final_loss, final_ppl, final_bpb, geom = evaluate_blocks(
@@ -581,6 +689,9 @@ def _train_single_run(
         ckpt_dir = os.path.join(output_dir, "checkpoints")
         os.makedirs(ckpt_dir, exist_ok=True)
         torch.save(base_model.state_dict(), os.path.join(ckpt_dir, f"{variant}__seed{seed}.pt"))
+
+    if (not keep_step_ckpt) and os.path.exists(step_ckpt_file):
+        os.remove(step_ckpt_file)
 
     return result
 
@@ -937,6 +1048,11 @@ def main() -> None:
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--save-checkpoints", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--ckpt-every", type=int, default=250)
+    parser.add_argument("--ckpt-mins", type=float, default=15.0)
+    parser.add_argument("--max-session-mins", type=float, default=0.0)
+    parser.add_argument("--max-steps-per-session", type=int, default=0)
+    parser.add_argument("--keep-step-checkpoints", action="store_true")
     parser.add_argument("--cache-dir", type=str, default="gor_research/paper_cache")
     parser.add_argument("--output-dir", type=str, default="gor_research/paper_results")
     args = parser.parse_args()
@@ -996,6 +1112,7 @@ def main() -> None:
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
     dev_name = torch.cuda.get_device_name(0) if device.type == "cuda" else str(device).upper()
 
+    session_t0 = time.perf_counter()
     runs: Dict[str, List[Dict[str, object]]] = {v: [] for v in variants}
     for seed in seeds:
         for v in variants:
@@ -1010,9 +1127,21 @@ def main() -> None:
                 use_compile=args.compile,
                 save_ckpt=args.save_checkpoints,
                 resume=not args.no_resume,
+                ckpt_every=args.ckpt_every,
+                ckpt_mins=args.ckpt_mins,
+                max_session_mins=args.max_session_mins,
+                max_steps_per_session=args.max_steps_per_session,
+                keep_step_ckpt=args.keep_step_checkpoints,
+                session_t0=session_t0,
                 output_dir=args.output_dir,
                 device=device,
             )
+            if res is None:
+                print(
+                    "[SessionPaused] Training paused after saving exact checkpoint. Re-run the exact same command to resume.",
+                    flush=True,
+                )
+                return
             runs[v].append(res)
 
     summary = aggregate_seed_runs(variants, runs)
