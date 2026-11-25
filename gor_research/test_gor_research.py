@@ -243,6 +243,76 @@ class TestGORResearch(unittest.TestCase):
             self.assertEqual(payload["summary"]["pre_norm_isotime"]["actual_layers"], 6)
             self.assertEqual(payload["summary"]["mhc"]["n_seeds"], 2)
 
+    def test_mid_run_two_session_resume_exact_parity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = os.path.join(tmpdir, "cache")
+            out_full = os.path.join(tmpdir, "full")
+            out_split = os.path.join(tmpdir, "split")
+            cwd = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            base_args = [
+                sys.executable,
+                "-m",
+                "gor_research.paper_scaling_study",
+                "--preset",
+                "smoke",
+                "--synthetic-lm",
+                "--seeds",
+                "42",
+                "--variants",
+                "pre_norm,attn_res_gor_v2",
+                "--steps",
+                "12",
+                "--device",
+                "cpu",
+                "--cache-dir",
+                cache_dir,
+            ]
+            subprocess.run(base_args + ["--output-dir", out_full], cwd=cwd, capture_output=True, text=True, check=True)
+
+            s1 = subprocess.run(
+                base_args + ["--max-steps-per-session", "7", "--output-dir", out_split],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("[SessionPaused]", s1.stdout)
+            self.assertFalse(os.path.exists(os.path.join(out_split, "paper_results.json")))
+            self.assertTrue(os.path.exists(os.path.join(out_split, "step_checkpoints", "pre_norm__seed42_latest.pt")))
+
+            subprocess.run(
+                base_args + ["--max-steps-per-session", "7", "--output-dir", out_split],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            subprocess.run(
+                base_args + ["--max-steps-per-session", "7", "--output-dir", out_split],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertTrue(os.path.exists(os.path.join(out_split, "paper_results.json")))
+            self.assertFalse(os.path.exists(os.path.join(out_split, "step_checkpoints", "pre_norm__seed42_latest.pt")))
+
+            with open(os.path.join(out_full, "paper_results.json"), "r", encoding="utf-8") as f:
+                r_full = json.load(f)
+            with open(os.path.join(out_split, "paper_results.json"), "r", encoding="utf-8") as f:
+                r_split = json.load(f)
+
+            for v in ("pre_norm", "attn_res_gor_v2"):
+                self.assertAlmostEqual(
+                    r_full["summary"][v]["val_bpb"]["mean"],
+                    r_split["summary"][v]["val_bpb"]["mean"],
+                    places=5,
+                )
+                self.assertEqual(
+                    r_full["runs"][v][0]["tokens_seen"],
+                    r_split["runs"][v][0]["tokens_seen"],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
