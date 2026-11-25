@@ -7,6 +7,8 @@ import torch.nn.functional as F
 
 from .residuals import (
     BlockAttnResConnector,
+    BlockAttnResGORv2Connector,
+    DualBankGORv2Connector,
     GORAntiDiluteResidual,
     GORBoundedResidual,
     GORv2Residual,
@@ -136,6 +138,9 @@ class FromScratchTransformerLM(nn.Module):
         elif config.residual_type == "std_dual_bank":
             self.res_op = None
             self.connector = StdDualBankConnector(config.dim, num_sublayers=num_sublayers)
+        elif config.residual_type == "dual_bank_gor_v2":
+            self.res_op = None
+            self.connector = DualBankGORv2Connector(config.dim, num_sublayers=num_sublayers, k=config.gor_k)
         elif config.residual_type == "gor_v3_subspace":
             self.res_op = None
             self.connector = GORv3SubspaceConnector(config.dim, num_sublayers=num_sublayers, k=config.gor_k)
@@ -143,6 +148,14 @@ class FromScratchTransformerLM(nn.Module):
             self.res_op = None
             self.connector = BlockAttnResConnector(
                 config.dim, num_sublayers=num_sublayers, num_blocks=config.attn_num_blocks
+            )
+        elif config.residual_type == "attn_res_gor_v2":
+            self.res_op = None
+            self.connector = BlockAttnResGORv2Connector(
+                config.dim,
+                num_sublayers=num_sublayers,
+                num_blocks=config.attn_num_blocks,
+                k=config.gor_k,
             )
         else:
             raise ValueError(f"Unknown residual_type: {config.residual_type}")

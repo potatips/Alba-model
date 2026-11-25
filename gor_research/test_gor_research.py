@@ -8,12 +8,22 @@ import tokenize
 import unittest
 import torch
 
-from gor_research.residuals import ALL_LM_RESIDUALS
+from gor_research.residuals import ALL_LM_RESIDUALS, GORv2Residual, _compute_gor_components
 from gor_research.run_colab_study import MatrixResidualBlock
 from gor_research.transformer_lm import FromScratchTransformerLM, TransformerConfig, clone_transformer_backbone
 
 
 class TestGORResearch(unittest.TestCase):
+    def test_gor_v2_algebraic_equivalence(self):
+        torch.manual_seed(11)
+        x = torch.randn(4, 16, 64)
+        u = torch.randn(4, 16, 64)
+        op = GORv2Residual(k=3.0, eps=1e-7)
+        fast_out = op(x, u)
+        xf, _, u_par, u_perp, rho, _ = _compute_gor_components(x, u, 1e-7)
+        ref_out = (xf + u_perp + (2.0 * torch.sigmoid(3.0 * rho)) * u_par).to(dtype=x.dtype)
+        self.assertLess((fast_out - ref_out).abs().max().item(), 1e-5)
+
     def test_zero_comments_in_gor_research(self):
         pkg_dir = os.path.dirname(os.path.abspath(__file__))
         for py_file in sorted(glob.glob(os.path.join(pkg_dir, "*.py"))):
@@ -60,6 +70,15 @@ class TestGORResearch(unittest.TestCase):
             blk = MatrixResidualBlock(32, 4, zero_arch)
             self.assertEqual(blk.count_overhead_params(), 0)
 
+        self.assertEqual(
+            MatrixResidualBlock(32, 4, "dual_bank_gor_v2").count_overhead_params(),
+            MatrixResidualBlock(32, 4, "std_dual_bank").count_overhead_params(),
+        )
+        self.assertEqual(
+            MatrixResidualBlock(32, 4, "attn_res_gor_v2").count_overhead_params(),
+            MatrixResidualBlock(32, 4, "attn_res_block").count_overhead_params(),
+        )
+
         with tempfile.TemporaryDirectory() as tmpdir:
             res = subprocess.run(
                 [
@@ -71,7 +90,7 @@ class TestGORResearch(unittest.TestCase):
                     "--quick",
                     "--synthetic-lm",
                     "--variants",
-                    "pre_norm,gor_antidilute,std_dual_bank,gor_v3_subspace",
+                    "pre_norm,gor_v2,std_dual_bank,dual_bank_gor_v2,attn_res_block,attn_res_gor_v2",
                     "--output-dir",
                     tmpdir,
                 ],

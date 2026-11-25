@@ -18,6 +18,8 @@ from .residuals import (
     ALL_LM_RESIDUALS,
     RESIDUAL_LABELS,
     BlockAttnResConnector,
+    BlockAttnResGORv2Connector,
+    DualBankGORv2Connector,
     GORAntiDiluteResidual,
     GORBoundedResidual,
     GORv2Residual,
@@ -40,8 +42,10 @@ ARCH_COLORS = {
     "gor_bounded": "#ea580c",
     "gor_antidilute": "#0d9488",
     "std_dual_bank": "#2563eb",
+    "dual_bank_gor_v2": "#0284c7",
     "gor_v3_subspace": "#7c3aed",
     "attn_res_block": "#16a34a",
+    "attn_res_gor_v2": "#be185d",
 }
 
 
@@ -72,12 +76,18 @@ class MatrixResidualBlock(nn.Module):
         elif residual_type == "std_dual_bank":
             self.res_op = None
             self.connector = StdDualBankConnector(dim, num_sublayers=num_layers)
+        elif residual_type == "dual_bank_gor_v2":
+            self.res_op = None
+            self.connector = DualBankGORv2Connector(dim, num_sublayers=num_layers, k=gor_k)
         elif residual_type == "gor_v3_subspace":
             self.res_op = None
             self.connector = GORv3SubspaceConnector(dim, num_sublayers=num_layers, k=gor_k)
         elif residual_type == "attn_res_block":
             self.res_op = None
             self.connector = BlockAttnResConnector(dim, num_sublayers=num_layers, num_blocks=8)
+        elif residual_type == "attn_res_gor_v2":
+            self.res_op = None
+            self.connector = BlockAttnResGORv2Connector(dim, num_sublayers=num_layers, num_blocks=8, k=gor_k)
         else:
             raise ValueError(f"Unknown residual_type: {residual_type}")
 
@@ -593,8 +603,9 @@ def render_report_assets(
     with open(png_path, "rb") as img_f:
         img_b64 = base64.b64encode(img_f.read()).decode("ascii")
 
-    base_mse = stage1["structured_l24"]["pre_norm"]["best_val_mse"]
-    base_bpb = stage2["pre_norm"]["final_val_bpb"]
+    base_arch = "pre_norm" if "pre_norm" in stage2 else variants[0]
+    base_mse = stage1["structured_l24"][base_arch]["best_val_mse"]
+    base_bpb = stage2[base_arch]["final_val_bpb"]
 
     rows_html = []
     for v in variants:

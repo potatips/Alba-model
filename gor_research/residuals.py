@@ -12,8 +12,10 @@ ALL_LM_RESIDUALS = (
     "gor_bounded",
     "gor_antidilute",
     "std_dual_bank",
+    "dual_bank_gor_v2",
     "gor_v3_subspace",
     "attn_res_block",
+    "attn_res_gor_v2",
 )
 
 RESIDUAL_LABELS = {
@@ -22,8 +24,10 @@ RESIDUAL_LABELS = {
     "gor_bounded": "GOR-Bounded (phi<=1, 0-Param)",
     "gor_antidilute": "GOR-AntiDilute (0-Param)",
     "std_dual_bank": "Std Dual-Bank Control",
+    "dual_bank_gor_v2": "Dual-Bank + GOR-v2 (phi<=2)",
     "gor_v3_subspace": "GOR-v3 Subspace Contrast",
     "attn_res_block": "Block AttnRes (N=8)",
+    "attn_res_gor_v2": "Block AttnRes + Attn-GOR-v2",
 }
 
 
@@ -72,6 +76,33 @@ def _compute_gor_components(
     return xf, uf, u_parallel, u_perp, rho, norm_x
 
 
+def _gor_v2_coeff(
+    ref: torch.Tensor,
+    u: torch.Tensor,
+    k: float,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rf = ref.float()
+    uf = u.float()
+    dot = (rf * uf).sum(dim=-1, keepdim=True)
+    norm_sq_r = (rf * rf).sum(dim=-1, keepdim=True) + eps
+    norm_sq_u = (uf * uf).sum(dim=-1, keepdim=True) + eps
+    rho = dot * torch.rsqrt(norm_sq_r * norm_sq_u)
+    phi = 2.0 * torch.sigmoid(k * rho)
+    coeff = (phi - 1.0) * (dot / norm_sq_r)
+    return rf, uf, coeff
+
+
+def _gor_v2_residual_add(x: torch.Tensor, u: torch.Tensor, k: float = 3.0, eps: float = 1e-7) -> torch.Tensor:
+    xf, uf, coeff = _gor_v2_coeff(x, u, k=k, eps=eps)
+    return ((1.0 + coeff) * xf + uf).to(dtype=x.dtype)
+
+
+def _gor_v2_transform_u(ref: torch.Tensor, u: torch.Tensor, k: float = 3.0, eps: float = 1e-7) -> torch.Tensor:
+    rf, uf, coeff = _gor_v2_coeff(ref, u, k=k, eps=eps)
+    return (uf + coeff * rf).to(dtype=u.dtype)
+
+
 class PreNormResidual(nn.Module):
     def forward(self, x: torch.Tensor, u: torch.Tensor, x0_norm: Optional[torch.Tensor] = None) -> torch.Tensor:
         return x + u
@@ -84,9 +115,7 @@ class GORv2Residual(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor, u: torch.Tensor, x0_norm: Optional[torch.Tensor] = None) -> torch.Tensor:
-        xf, _, u_par, u_perp, rho, _ = _compute_gor_components(x, u, self.eps)
-        phi = 2.0 * torch.sigmoid(self.k * rho)
-        return (xf + u_perp + phi * u_par).to(dtype=x.dtype)
+        return _gor_v2_residual_add(x, u, k=self.k, eps=self.eps)
 
 
 class GORBoundedResidual(nn.Module):
@@ -128,6 +157,7 @@ class ResidualBankState:
     x0_norm: Optional[torch.Tensor] = None
     s_fast: Optional[torch.Tensor] = None
     s_slow: Optional[torch.Tensor] = None
+    last_read: Optional[torch.Tensor] = None
     completed: List[torch.Tensor] = field(default_factory=list)
     completed_keys: List[torch.Tensor] = field(default_factory=list)
     partial: Optional[torch.Tensor] = None
@@ -167,6 +197,17 @@ class StdDualBankConnector(nn.Module):
 
     def finalize(self, state: ResidualBankState) -> torch.Tensor:
         return state.s_fast + state.s_slow
+
+
+class DualBankGORv2Connector(StdDualBankConnector):
+    def __init__(self, dim: int, num_sublayers: int, k: float = 3.0, eps: float = 1e-7):
+        super().__init__(dim, num_sublayers=num_sublayers)
+        self.k = k
+        self.eps = eps
+
+    def update(self, state: ResidualBankState, u: torch.Tensor, sublayer_idx: int) -> None:
+        state.s_fast = _gor_v2_residual_add(state.s_fast, u, k=self.k, eps=self.eps)
+        state.s_slow = state.s_slow + u * self.inv_sqrt_l
 
 
 class GORv3SubspaceConnector(nn.Module):
@@ -223,6 +264,17 @@ class GORv3SubspaceConnector(nn.Module):
         return state.s_fast + state.s_slow
 
 
+class DualBankGORv2Connector(StdDualBankConnector):
+    def __init__(self, dim: int, num_sublayers: int, k: float = 3.0, eps: float = 1e-7):
+        super().__init__(dim, num_sublayers=num_sublayers)
+        self.k = k
+        self.eps = eps
+
+    def update(self, state: ResidualBankState, u: torch.Tensor, sublayer_idx: int) -> None:
+        state.s_fast = _gor_v2_residual_add(state.s_fast, u, k=self.k, eps=self.eps)
+        state.s_slow = state.s_slow + u * self.inv_sqrt_l
+
+
 class BlockAttnResConnector(nn.Module):
     def __init__(self, dim: int, num_sublayers: int, num_blocks: int = 8):
         super().__init__()
@@ -271,3 +323,21 @@ class BlockAttnResConnector(nn.Module):
 
     def finalize(self, state: ResidualBankState) -> torch.Tensor:
         return self._attend(state.completed, state.completed_keys, self.depth_queries[self.num_sublayers - 1])
+
+
+class BlockAttnResGORv2Connector(BlockAttnResConnector):
+    def __init__(self, dim: int, num_sublayers: int, num_blocks: int = 8, k: float = 3.0, eps: float = 1e-7):
+        super().__init__(dim, num_sublayers=num_sublayers, num_blocks=num_blocks)
+        self.k = k
+        self.eps = eps
+
+    def read(self, state: ResidualBankState, sublayer_idx: int) -> torch.Tensor:
+        out = super().read(state, sublayer_idx)
+        state.last_read = out
+        return out
+
+    def update(self, state: ResidualBankState, u: torch.Tensor, sublayer_idx: int) -> None:
+        u_eff = u
+        if sublayer_idx % 2 == 0 and state.last_read is not None:
+            u_eff = _gor_v2_transform_u(state.last_read, u, k=self.k, eps=self.eps)
+        super().update(state, u_eff, sublayer_idx)
