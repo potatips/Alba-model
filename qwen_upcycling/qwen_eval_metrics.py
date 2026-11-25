@@ -254,12 +254,27 @@ def evaluate_qwen_variant_full(
     max_length: int = 512,
     eval_batch_size: int = 4,
     device: str = "cuda",
+    eval_tool_texts: Optional[List[str]] = None,
 ) -> Dict:
     params_info = count_model_params(model)
     logic_res = evaluate_domain_bpb(model, tokenizer, eval_logic_texts, max_length=max_length, batch_size=eval_batch_size, device=device)
     code_res = evaluate_domain_bpb(model, tokenizer, eval_code_texts, max_length=max_length, batch_size=eval_batch_size, device=device)
-    overall_bpb = round(0.5 * (logic_res["bpb"] + code_res["bpb"]), 4)
-    overall_loss = round(0.5 * (logic_res["loss"] + code_res["loss"]), 4)
+
+    tool_metrics = {}
+    in_dist_bpbs = [logic_res["bpb"], code_res["bpb"]]
+    in_dist_losses = [logic_res["loss"], code_res["loss"]]
+    if eval_tool_texts:
+        tool_res = evaluate_domain_bpb(model, tokenizer, eval_tool_texts, max_length=max_length, batch_size=eval_batch_size, device=device)
+        tool_metrics = {
+            "tool_bpb": tool_res["bpb"],
+            "tool_ppl": tool_res["ppl"],
+            "tool_loss": tool_res["loss"],
+        }
+        in_dist_bpbs.append(tool_res["bpb"])
+        in_dist_losses.append(tool_res["loss"])
+
+    overall_bpb = round(float(np.mean(in_dist_bpbs)), 4)
+    overall_loss = round(float(np.mean(in_dist_losses)), 4)
     overall_ppl = round(float(math.exp(min(overall_loss, 20.0))), 3)
 
     ood_metrics = {}
@@ -298,6 +313,7 @@ def evaluate_qwen_variant_full(
         "logic_ppl": logic_res["ppl"],
         "code_bpb": code_res["bpb"],
         "code_ppl": code_res["ppl"],
+        **tool_metrics,
         **ood_metrics,
         **geom,
     }
@@ -519,6 +535,215 @@ th {{ background:#f1f5f9; padding:10px 6px; border-bottom:2px solid #cbd5e1; }}
 </table>
 <div class="fig">
 <img src="data:image/png;base64,{plot_b64}" alt="Qwen-2.5-3B Ablation 6-Panel Grid">
+</div>
+</div>
+</body>
+</html>
+"""
+    with open(output_html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return output_html_path
+
+
+def generate_graft_html_report(
+    results: Dict[str, Dict],
+    output_html_path: str = "qwen3b_residual_graft_report.html",
+    output_png_path: str = "qwen3b_residual_graft_grid.png",
+) -> str:
+    fig, axes = plt.subplots(2, 3, figsize=(22, 12.5), dpi=150)
+    plt.subplots_adjust(hspace=0.40, wspace=0.26)
+
+    names = list(results.keys())
+    colors = ["#475569", "#dc2626", "#16a34a", "#7c3aed", "#2563eb"][: max(len(names), 1)]
+    has_tool = all("tool_bpb" in results[n] for n in names) if names else False
+    has_ood = all("ood_bpb" in results[n] for n in names) if names else False
+
+    ax1 = axes[0, 0]
+    x_pos = np.arange(len(names))
+    bar_series = [
+        ("Logic BPB", "logic_bpb", "#2563eb"),
+        ("Code BPB", "code_bpb", "#16a34a"),
+    ]
+    if has_tool:
+        bar_series.append(("Tool BPB", "tool_bpb", "#f59e0b"))
+    if has_ood:
+        bar_series.append(("OOD BPB", "ood_bpb", "#9333ea"))
+    w = 0.78 / max(len(bar_series), 1)
+    offset0 = -0.5 * (len(bar_series) - 1) * w
+    for idx, (label, key, col) in enumerate(bar_series):
+        ax1.bar(
+            x_pos + offset0 + idx * w,
+            [results[n][key] for n in names],
+            width=w,
+            label=label,
+            color=col,
+        )
+    ax1.set_title("Panel 1: Logic / Code / Tool / External OOD BPB", fontsize=11, fontweight="bold")
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels(names, rotation=20, ha="right", fontsize=8)
+    ax1.set_ylabel("Bits-Per-Byte (Lower Better)")
+    ax1.grid(True, axis="y", linestyle=":", alpha=0.6)
+    ax1.legend(fontsize=8)
+
+    ax2 = axes[0, 1]
+    for n, c in zip(names, colors):
+        hist = results[n].get("train_loss_curve", [])
+        if hist:
+            ax2.plot([pt[0] for pt in hist], [pt[1] for pt in hist], label=n, color=c, linewidth=2.2)
+    ax2.set_title("Panel 2: Training LM Loss Convergence", fontsize=11, fontweight="bold")
+    ax2.set_xlabel("Optimization Step")
+    ax2.set_ylabel("Training LM Loss")
+    ax2.grid(True, linestyle=":", alpha=0.6)
+    ax2.legend(fontsize=7.5, loc="best")
+
+    ax3 = axes[0, 2]
+    for n, c in zip(names, colors):
+        curve = results[n].get("conflict_curve", [])
+        if curve:
+            ax3.plot(np.linspace(0, 100, len(curve)), curve, label=n, color=c, linewidth=1.8)
+    ax3.set_title("Panel 3: Layer Residual Conflict Rate (%)", fontsize=11, fontweight="bold")
+    ax3.set_xlabel("Depth (%)")
+    ax3.set_ylabel("Destructive Conflict (%)")
+    ax3.grid(True, linestyle=":", alpha=0.6)
+    ax3.legend(fontsize=7, loc="best")
+
+    ax4 = axes[1, 0]
+    for n, c in zip(names, colors):
+        curve = results[n].get("erank_curve", [])
+        if curve:
+            ax4.plot(np.linspace(0, 100, len(curve)), curve, label=n, color=c, linewidth=1.8)
+    ax4.set_title("Panel 4: Representation Effective Rank", fontsize=11, fontweight="bold")
+    ax4.set_xlabel("Depth (%)")
+    ax4.set_ylabel("erank_norm / min(T, d)")
+    ax4.grid(True, linestyle=":", alpha=0.6)
+    ax4.legend(fontsize=7, loc="best")
+
+    ax5 = axes[1, 1]
+    attn_g = [results[n].get("mean_abs_alpha_attn", 0.0) for n in names]
+    mlp_g = [results[n].get("mean_abs_alpha_mlp", 0.0) for n in names]
+    gor_g = [results[n].get("mean_abs_beta_gor", 0.0) for n in names]
+    gw = 0.25
+    ax5.bar(x_pos - gw, attn_g, width=gw, label="|tanh(alpha_attn)|", color="#0ea5e9")
+    ax5.bar(x_pos, mlp_g, width=gw, label="|tanh(alpha_mlp)|", color="#10b981")
+    ax5.bar(x_pos + gw, gor_g, width=gw, label="|tanh(beta_gor)|", color="#a855f7")
+    ax5.set_title("Panel 5: Learned Zero-Gate Activation", fontsize=11, fontweight="bold")
+    ax5.set_xticks(x_pos)
+    ax5.set_xticklabels(names, rotation=20, ha="right", fontsize=8)
+    ax5.set_ylabel("Mean |Gate| (0 = Pure Qwen)")
+    ax5.grid(True, axis="y", linestyle=":", alpha=0.6)
+    ax5.legend(fontsize=8)
+
+    ax6 = axes[1, 2]
+    if has_ood:
+        for idx, (n, c) in enumerate(zip(names, colors)):
+            r = results[n]
+            ax6.scatter(r["overall_bpb"], r["ood_bpb"], color=c, s=140, edgecolors="black", zorder=5)
+            dx = 8 if idx % 2 == 0 else -14
+            dy = 10 if idx % 3 == 0 else -16
+            ax6.annotate(
+                f"{n}\n({r['overall_bpb']:.4f}, {r['ood_bpb']:.4f})",
+                (r["overall_bpb"], r["ood_bpb"]),
+                textcoords="offset points",
+                xytext=(dx, dy),
+                fontsize=7.5,
+                fontweight="bold",
+                color=c,
+                arrowprops=dict(arrowstyle="-", color=c, lw=0.7, alpha=0.6),
+            )
+        ax6.set_title("Panel 6: In-Dist Overall vs OOD BPB (Bottom-Left Best)", fontsize=11, fontweight="bold")
+        ax6.set_xlabel("In-Distribution Overall BPB")
+        ax6.set_ylabel("External OOD BPB")
+        ax6.grid(True, linestyle=":", alpha=0.6)
+
+    fig.savefig(output_png_path, format="png", bbox_inches="tight")
+    buf = BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    plot_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    ranked = sorted(results.items(), key=lambda kv: kv[1]["overall_bpb"])
+    winner_name, winner_res = ranked[0]
+
+    rows_html = []
+    for rank, (m_name, r) in enumerate(ranked, 1):
+        bg = "#f0fdf4" if rank == 1 else "#ffffff"
+        tool_cell = f"<td style='padding:8px;'>{r['tool_bpb']} ({r['tool_ppl']})</td>" if has_tool else ""
+        ood_cell = (
+            f"<td style='padding:8px; font-weight:bold; color:#7e22ce;'>{r['ood_bpb']}</td>"
+            f"<td style='padding:8px;'>{r.get('ood_logic_bpb', '—')} / {r.get('ood_code_bpb', '—')} / {r.get('ood_general_bpb', '—')}</td>"
+            if has_ood
+            else ""
+        )
+        gate_str = f"{r.get('mean_abs_alpha_attn', 0.0)} / {r.get('mean_abs_alpha_mlp', 0.0)} / {r.get('mean_abs_beta_gor', 0.0)}"
+        rows_html.append(
+            f"<tr style='background:{bg}; border-bottom:1px solid #e2e8f0;'>"
+            f"<td style='padding:8px; font-weight:bold;'>#{rank}</td>"
+            f"<td style='padding:8px; text-align:left; font-weight:bold;'>{m_name}</td>"
+            f"<td style='padding:8px;'>{r['total_params_b']}B</td>"
+            f"<td style='padding:8px; font-weight:bold; color:#0f766e;'>{r['overall_bpb']}</td>"
+            f"<td style='padding:8px;'>{r['logic_bpb']} ({r['logic_ppl']})</td>"
+            f"<td style='padding:8px;'>{r['code_bpb']} ({r['code_ppl']})</td>"
+            f"{tool_cell}"
+            f"{ood_cell}"
+            f"<td style='padding:8px;'>{r['avg_conflict_pct']}%</td>"
+            f"<td style='padding:8px;'>{r['avg_erank_norm']}</td>"
+            f"<td style='padding:8px;'>{gate_str}</td>"
+            f"<td style='padding:8px;'>{r.get('peak_vram_gb', 0.0)} GB</td>"
+            f"<td style='padding:8px;'>{r['throughput_tok_s']}</td>"
+            f"</tr>"
+        )
+
+    tool_th = "<th>Tool BPB (PPL)</th>" if has_tool else ""
+    ood_th = "<th>OOD BPB</th><th>OOD (MMLU / HumanEval / Wiki)</th>" if has_ood else ""
+    winner_ood_note = f", OOD BPB: <strong>{winner_res['ood_bpb']}</strong>" if has_ood else ""
+    winner_tool_note = f", Tool: {winner_res['tool_bpb']}" if has_tool else ""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Qwen-2.5 Zero-Gated Residual Graft Benchmark Report</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:#f8fafc; color:#0f172a; padding:24px; }}
+.container {{ max-width:1460px; margin:0 auto; background:#fff; padding:28px; border-radius:12px; border:1px solid #e2e8f0; }}
+h1 {{ border-bottom:2px solid #2563eb; padding-bottom:10px; font-size:24px; }}
+table {{ width:100%; border-collapse:collapse; font-size:12px; text-align:center; margin-top:16px; }}
+th {{ background:#f1f5f9; padding:10px 6px; border-bottom:2px solid #cbd5e1; }}
+.winner {{ background:#f0fdf4; border-left:4px solid #16a34a; padding:14px; margin:16px 0; border-radius:0 8px 8px 0; }}
+.fig {{ text-align:center; margin-top:24px; }}
+.fig img {{ max-width:100%; border:1px solid #cbd5e1; border-radius:8px; }}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Qwen-2.5 Zero-Gated Residual Graft Study: Baseline vs BlockAttnRes vs AttnRes-GOR-v2</h1>
+<div class="winner">
+<strong>Top Ranked In-Dist Model:</strong> {winner_name} — Overall BPB: <strong>{winner_res['overall_bpb']}</strong> (Logic: {winner_res['logic_bpb']}, Code: {winner_res['code_bpb']}{winner_tool_note}{winner_ood_note}).
+</div>
+<table>
+<thead>
+<tr>
+<th>Rank</th>
+<th style="text-align:left;">Variant</th>
+<th>Params</th>
+<th>Overall BPB</th>
+<th>Logic BPB (PPL)</th>
+<th>Code BPB (PPL)</th>
+{tool_th}
+{ood_th}
+<th>Conflict (%)</th>
+<th>Avg erank_norm</th>
+<th>Gates (attn / mlp / gor)</th>
+<th>Peak VRAM</th>
+<th>Tok/s</th>
+</tr>
+</thead>
+<tbody>
+{''.join(rows_html)}
+</tbody>
+</table>
+<div class="fig">
+<img src="data:image/png;base64,{plot_b64}" alt="Qwen Residual Graft 6-Panel Grid">
 </div>
 </div>
 </body>

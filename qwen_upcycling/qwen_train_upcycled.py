@@ -1,3 +1,4 @@
+import argparse
 import gc
 import json
 import math
@@ -14,10 +15,52 @@ from qwen_dataset import (
     build_or_load_ood_eval_dataset,
     get_eval_texts,
     get_ood_eval_texts,
+    get_tool_eval_texts,
 )
-from qwen_eval_metrics import evaluate_qwen_variant_full, generate_ablation_html_report
+from qwen_eval_metrics import (
+    evaluate_qwen_variant_full,
+    generate_ablation_html_report,
+    generate_graft_html_report,
+)
 from qwen_geo_muon import create_qwen_adamw_optimizer, create_qwen_geomuon_optimizer
 from qwen_moefication import build_qwen_variant, collect_ortho_loss, count_model_params
+from qwen_residual_graft import apply_residual_graft_to_qwen, collect_graft_gate_stats
+
+
+QWEN_RESIDUAL_GRAFT_VARIANTS = [
+    {
+        "name": "Qwen-2.5-3B (Base Untouched)",
+        "enable_gor": False,
+        "enable_moe": False,
+        "enable_block_attn_res": False,
+        "enable_gor_v2": False,
+        "optimizer": "none",
+    },
+    {
+        "name": "Qwen-2.5-3B (Baseline SFT)",
+        "enable_gor": False,
+        "enable_moe": False,
+        "enable_block_attn_res": False,
+        "enable_gor_v2": False,
+        "optimizer": "adamw",
+    },
+    {
+        "name": "Qwen-2.5-3B + Zero-Gated BlockAttnRes",
+        "enable_gor": False,
+        "enable_moe": False,
+        "enable_block_attn_res": True,
+        "enable_gor_v2": False,
+        "optimizer": "adamw",
+    },
+    {
+        "name": "Qwen-2.5-3B + Zero-Gated AttnRes-GOR-v2",
+        "enable_gor": False,
+        "enable_moe": False,
+        "enable_block_attn_res": True,
+        "enable_gor_v2": True,
+        "optimizer": "adamw",
+    },
+]
 
 
 GOR_VS_BASELINE_VARIANTS = [
@@ -167,6 +210,10 @@ def train_single_variant(
     top_k: int = 2,
     seed: int = 42,
     save_checkpoint_dir: Optional[str] = None,
+    eval_tool_texts: Optional[List[str]] = None,
+    graft_lr: Optional[float] = None,
+    num_blocks: int = 9,
+    gor_k: float = 3.0,
 ) -> Dict:
     _seed_everything(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -182,7 +229,16 @@ def train_single_variant(
 
     t_start = time.perf_counter()
     model = _load_base_model(model_name, device=device, dtype=dtype)
-    if variant_cfg["enable_gor"] or variant_cfg["enable_moe"]:
+    use_block_graft = variant_cfg.get("enable_block_attn_res", False)
+    if use_block_graft:
+        apply_residual_graft_to_qwen(
+            model=model,
+            enable_gor_v2=variant_cfg.get("enable_gor_v2", False),
+            num_blocks=num_blocks,
+            gor_k=gor_k,
+            use_sublayer_checkpointing=True,
+        )
+    elif variant_cfg["enable_gor"] or variant_cfg["enable_moe"]:
         model = build_qwen_variant(
             model=model,
             enable_gor=variant_cfg["enable_gor"],
@@ -199,13 +255,18 @@ def train_single_variant(
     opt_type = variant_cfg["optimizer"]
 
     if opt_type != "none" and total_steps > 0:
-        if hasattr(model, "gradient_checkpointing_enable"):
+        if not use_block_graft and hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
 
         if opt_type == "geo_muon":
             optimizer = create_qwen_geomuon_optimizer(model, lr=muon_lr, weight_decay=0.01)
         else:
-            optimizer = create_qwen_adamw_optimizer(model, lr=adamw_lr, weight_decay=0.01)
+            optimizer = create_qwen_adamw_optimizer(
+                model,
+                lr=adamw_lr,
+                weight_decay=0.01,
+                graft_lr=graft_lr,
+            )
 
         base_lrs = [g["lr"] for g in optimizer.param_groups]
         warmup_steps = max(1, int(total_steps * 0.1))
@@ -285,7 +346,9 @@ def train_single_variant(
         max_length=512,
         eval_batch_size=4,
         device=device,
+        eval_tool_texts=eval_tool_texts,
     )
+    gate_stats = collect_graft_gate_stats(model)
 
     peak_vram = round(torch.cuda.max_memory_allocated() / 1e9, 2) if device == "cuda" else 0.0
     elapsed_sec = round(time.perf_counter() - t_start, 1)
@@ -295,13 +358,18 @@ def train_single_variant(
     eval_metrics["elapsed_sec"] = elapsed_sec
     eval_metrics["enable_gor"] = variant_cfg["enable_gor"]
     eval_metrics["enable_moe"] = variant_cfg["enable_moe"]
+    eval_metrics["enable_block_attn_res"] = variant_cfg.get("enable_block_attn_res", False)
+    eval_metrics["enable_gor_v2"] = variant_cfg.get("enable_gor_v2", False)
     eval_metrics["optimizer"] = opt_type
+    eval_metrics.update(gate_stats)
 
+    tool_summary = f", Tool: {eval_metrics['tool_bpb']}" if "tool_bpb" in eval_metrics else ""
     ood_summary = f" | OOD BPB: {eval_metrics['ood_bpb']}" if "ood_bpb" in eval_metrics else ""
     print(
         f"Finished {v_name} in {elapsed_sec}s | Overall BPB: {eval_metrics['overall_bpb']} "
-        f"(Logic: {eval_metrics['logic_bpb']}, Code: {eval_metrics['code_bpb']}){ood_summary} | "
-        f"Conflict: {eval_metrics['avg_conflict_pct']}% | Peak VRAM: {peak_vram} GB"
+        f"(Logic: {eval_metrics['logic_bpb']}, Code: {eval_metrics['code_bpb']}{tool_summary}){ood_summary} | "
+        f"Conflict: {eval_metrics['avg_conflict_pct']}% | Gates(a/g): {eval_metrics['mean_abs_alpha_attn']}/{eval_metrics['mean_abs_beta_gor']} | "
+        f"Peak VRAM: {peak_vram} GB"
     )
 
     del model
@@ -416,5 +484,135 @@ def run_qwen3b_ablation_suite(
     return results
 
 
+def run_qwen_residual_graft_suite(
+    model_name: str = "Qwen/Qwen2.5-3B",
+    total_steps: int = 240,
+    seq_len: int = 512,
+    micro_batch_size: int = 2,
+    grad_accum_steps: int = 8,
+    n_train_logic: int = 1800,
+    n_train_code: int = 1800,
+    n_train_tool: int = 1200,
+    n_eval_logic: int = 100,
+    n_eval_code: int = 100,
+    n_eval_tool: int = 80,
+    adamw_lr: float = 2.5e-5,
+    graft_lr: float = 5e-3,
+    num_blocks: int = 9,
+    gor_k: float = 3.0,
+    dataset_cache_path: str = "qwen_logic_code_tool_dataset.json",
+    ood_cache_path: str = "qwen_ood_eval_dataset.json",
+    n_ood_per_domain: int = 80,
+    results_cache_path: str = "qwen3b_residual_graft_results.json",
+    output_html_path: str = "qwen3b_residual_graft_report.html",
+    output_png_path: str = "qwen3b_residual_graft_grid.png",
+    seed: int = 42,
+) -> Dict[str, Dict]:
+    dataset_payload = build_or_load_logic_code_dataset(
+        cache_path=dataset_cache_path,
+        n_train_logic=n_train_logic,
+        n_train_code=n_train_code,
+        n_eval_logic=n_eval_logic,
+        n_eval_code=n_eval_code,
+        seed=seed,
+        n_train_tool=n_train_tool,
+        n_eval_tool=n_eval_tool,
+    )
+    print(f"Dataset ready: {dataset_payload['meta']}")
+
+    ood_payload = build_or_load_ood_eval_dataset(
+        cache_path=ood_cache_path,
+        n_ood_logic=n_ood_per_domain,
+        n_ood_code=n_ood_per_domain,
+        n_ood_general=n_ood_per_domain,
+        seed=seed,
+    )
+    ood_eval_texts = get_ood_eval_texts(ood_payload)
+    print(f"OOD Eval Dataset ready: {ood_payload['meta']}")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=False)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    train_dataset = CausalTextDataset(dataset_payload["train"], tokenizer, max_length=seq_len)
+    eval_logic_texts, eval_code_texts = get_eval_texts(dataset_payload)
+    eval_tool_texts = get_tool_eval_texts(dataset_payload)
+
+    results = {}
+    if os.path.exists(results_cache_path):
+        try:
+            with open(results_cache_path, "r", encoding="utf-8") as f:
+                results = json.load(f)
+            print(f"Resumed {len(results)} completed variants from {results_cache_path}")
+        except Exception:
+            results = {}
+
+    for cfg in QWEN_RESIDUAL_GRAFT_VARIANTS:
+        v_name = cfg["name"]
+        if (
+            v_name in results
+            and "overall_bpb" in results[v_name]
+            and "ood_bpb" in results[v_name]
+            and "tool_bpb" in results[v_name]
+        ):
+            print(f"Skipping already completed variant: {v_name}")
+            continue
+
+        metrics = train_single_variant(
+            variant_cfg=cfg,
+            model_name=model_name,
+            tokenizer=tokenizer,
+            train_dataset=train_dataset,
+            eval_logic_texts=eval_logic_texts,
+            eval_code_texts=eval_code_texts,
+            ood_eval_texts=ood_eval_texts,
+            total_steps=total_steps,
+            micro_batch_size=micro_batch_size,
+            grad_accum_steps=grad_accum_steps,
+            adamw_lr=adamw_lr,
+            seed=seed,
+            eval_tool_texts=eval_tool_texts,
+            graft_lr=graft_lr,
+            num_blocks=num_blocks,
+            gor_k=gor_k,
+        )
+        results[v_name] = metrics
+        with open(results_cache_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+
+    report_path = generate_graft_html_report(
+        results=results,
+        output_html_path=output_html_path,
+        output_png_path=output_png_path,
+    )
+    print(f"Residual Graft HTML report exported to: {report_path}")
+    return results
+
+
 if __name__ == "__main__":
-    run_qwen3b_ablation_suite()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", type=str, default="residual_graft", choices=["residual_graft", "ablation"])
+    parser.add_argument("--model-name", type=str, default="Qwen/Qwen2.5-3B")
+    parser.add_argument("--steps", type=int, default=240)
+    parser.add_argument("--seq-len", type=int, default=512)
+    parser.add_argument("--lr", type=float, default=2.5e-5)
+    parser.add_argument("--graft-lr", type=float, default=5e-3)
+    parser.add_argument("--output-dir", type=str, default=".")
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    if args.mode == "residual_graft":
+        run_qwen_residual_graft_suite(
+            model_name=args.model_name,
+            total_steps=args.steps,
+            seq_len=args.seq_len,
+            adamw_lr=args.lr,
+            graft_lr=args.graft_lr,
+            dataset_cache_path=os.path.join(args.output_dir, "qwen_logic_code_tool_dataset.json"),
+            ood_cache_path=os.path.join(args.output_dir, "qwen_ood_eval_dataset.json"),
+            results_cache_path=os.path.join(args.output_dir, "qwen3b_residual_graft_results.json"),
+            output_html_path=os.path.join(args.output_dir, "qwen3b_residual_graft_report.html"),
+            output_png_path=os.path.join(args.output_dir, "qwen3b_residual_graft_grid.png"),
+        )
+    else:
+        run_qwen3b_ablation_suite(model_name=args.model_name, total_steps=args.steps, seq_len=args.seq_len)
