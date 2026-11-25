@@ -24,6 +24,7 @@ from .residuals import (
     GORBoundedResidual,
     GORv2Residual,
     GORv3SubspaceConnector,
+    MHCConnector,
     PreNormResidual,
     RMSNorm,
     StdDualBankConnector,
@@ -44,6 +45,7 @@ ARCH_COLORS = {
     "std_dual_bank": "#2563eb",
     "dual_bank_gor_v2": "#0284c7",
     "gor_v3_subspace": "#7c3aed",
+    "mhc": "#ca8a04",
     "attn_res_block": "#16a34a",
     "attn_res_gor_v2": "#be185d",
 }
@@ -82,6 +84,9 @@ class MatrixResidualBlock(nn.Module):
         elif residual_type == "gor_v3_subspace":
             self.res_op = None
             self.connector = GORv3SubspaceConnector(dim, num_sublayers=num_layers, k=gor_k)
+        elif residual_type == "mhc":
+            self.res_op = None
+            self.connector = MHCConnector(dim, num_sublayers=num_layers, n_streams=4)
         elif residual_type == "attn_res_block":
             self.res_op = None
             self.connector = BlockAttnResConnector(dim, num_sublayers=num_layers, num_blocks=8)

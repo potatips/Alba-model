@@ -8,7 +8,7 @@ import tokenize
 import unittest
 import torch
 
-from gor_research.residuals import ALL_LM_RESIDUALS, GORv2Residual, _compute_gor_components
+from gor_research.residuals import ALL_LM_RESIDUALS, GORv2Residual, _compute_gor_components, sinkhorn_knopp
 from gor_research.run_colab_study import MatrixResidualBlock
 from gor_research.transformer_lm import FromScratchTransformerLM, TransformerConfig, clone_transformer_backbone
 from src.config import ModelArgs
@@ -175,6 +175,73 @@ class TestGORResearch(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "alba_reasoning_results.json")))
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "alba_reasoning_report.png")))
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "alba_reasoning_report.html")))
+
+    def test_mhc_sinkhorn_and_grad_checkpoint_parity(self):
+        torch.manual_seed(21)
+        logits = torch.randn(3, 5, 4, 4)
+        ds = sinkhorn_knopp(logits, iters=12)
+        self.assertTrue(torch.all(ds > 0).item())
+        self.assertLess((ds.sum(dim=-1) - 1.0).abs().max().item(), 1e-4)
+        self.assertLess((ds.sum(dim=-2) - 1.0).abs().max().item(), 1e-4)
+
+        for arch in ("pre_norm", "mhc", "attn_res_gor_v2"):
+            x = torch.randint(0, 64, (2, 8))
+            y = torch.randint(0, 64, (2, 8))
+            torch.manual_seed(31)
+            m_no_ckpt = FromScratchTransformerLM(
+                TransformerConfig(vocab_size=64, dim=32, n_layers=4, n_heads=4, max_seq_len=16, residual_type=arch, gradient_checkpointing=False)
+            )
+            torch.manual_seed(31)
+            m_ckpt = FromScratchTransformerLM(
+                TransformerConfig(vocab_size=64, dim=32, n_layers=4, n_heads=4, max_seq_len=16, residual_type=arch, gradient_checkpointing=True)
+            )
+            l1, loss1, _ = m_no_ckpt(x, targets=y)
+            l2, loss2, _ = m_ckpt(x, targets=y)
+            self.assertLess((l1 - l2).abs().max().item(), 1e-5)
+            self.assertLess(abs(loss1.item() - loss2.item()), 1e-5)
+            loss1.backward()
+            loss2.backward()
+            for (n1, p1), (_, p2) in zip(m_no_ckpt.named_parameters(), m_ckpt.named_parameters()):
+                if p1.grad is not None:
+                    self.assertLess((p1.grad - p2.grad).abs().max().item(), 1e-5, f"Grad mismatch in {arch}:{n1}")
+
+    def test_paper_scaling_smoke_and_latex_export(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = os.path.join(tmpdir, "cache")
+            out_dir = os.path.join(tmpdir, "out")
+            res = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "gor_research.paper_scaling_study",
+                    "--preset",
+                    "smoke",
+                    "--synthetic-lm",
+                    "--seeds",
+                    "42,43",
+                    "--variants",
+                    "pre_norm,pre_norm_isotime,mhc,gor_v2,attn_res_block,attn_res_gor_v2",
+                    "--optimizer",
+                    "geomuon",
+                    "--device",
+                    "cpu",
+                    "--cache-dir",
+                    cache_dir,
+                    "--output-dir",
+                    out_dir,
+                ],
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("Saved TEX:", res.stdout)
+            for fname in ("paper_results.json", "paper_figures.png", "paper_figures.pdf", "paper_tables.tex", "paper_report.html"):
+                self.assertTrue(os.path.exists(os.path.join(out_dir, fname)), f"Missing {fname}")
+            with open(os.path.join(out_dir, "paper_results.json"), "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            self.assertEqual(payload["summary"]["pre_norm_isotime"]["actual_layers"], 6)
+            self.assertEqual(payload["summary"]["mhc"]["n_seeds"], 2)
 
 
 if __name__ == "__main__":
