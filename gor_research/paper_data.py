@@ -290,6 +290,7 @@ def build_or_load_fineweb_edu_corpus(
         val_buf: List[int] = []
         val_count = 0
         val_bytes = 0
+        val_logged = False
 
         train_chunks: List[np.ndarray] = []
         train_buf: List[int] = []
@@ -320,12 +321,16 @@ def build_or_load_fineweb_edu_corpus(
                     val_buf = []
                 continue
 
+            if not val_logged:
+                print(f"  packed val tokens: {val_count:,} / {val_tokens:,}", flush=True)
+                val_logged = True
+
             train_buf.extend(ids)
             train_count += len(ids)
             if len(train_buf) >= flush_threshold:
                 train_chunks.append(np.array(train_buf, dtype=np_dtype))
                 train_buf = []
-                if train_count % 20_000_000 < flush_threshold:
+                if train_count % 5_000_000 < flush_threshold:
                     print(f"  packed train tokens: {train_count:,} / {train_tokens:,}", flush=True)
 
             if train_count >= train_tokens:
