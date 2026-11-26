@@ -31,21 +31,18 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e
     """
     assert len(G.shape) >= 2, f"Newton-Schulz yêu cầu ma trận >= 2 chiều, nhận được shape {G.shape}"
     a, b, c = (3.4445, -4.7750, 2.0315)
-    
-    # Tính toán ở định dạng Float32 để đảm bảo độ ổn định số học
-    X = G.float()
+
+    use_bf16 = G.is_cuda and torch.cuda.is_bf16_supported()
+    X = G.bfloat16() if use_bf16 else G.float()
     transposed = False
-    
-    # Luôn làm việc trên ma trận có m <= n (nếu m > n, chuyển vị để giảm kích cỡ ma trận nhân)
+
     if X.size(-2) > X.size(-1):
         X = X.mT
         transposed = True
 
-    # Chuẩn hóa tiền định phổ (Pre-scaling)
-    norm = X.norm(dim=(-2, -1), keepdim=True) + eps
+    norm = X.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
     X = X / norm
 
-    # Chuỗi lặp bậc 5 đại số (Tận dụng addmm nếu là ma trận 2D để tránh cấp phát bộ nhớ)
     for _ in range(steps):
         A = X @ X.mT
         if X.dim() == 2:
@@ -63,8 +60,8 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e
 
 class GEOMuon(torch.optim.Optimizer):
     """
-    Bộ tối ưu hóa kết hợp GEO-Muon + AdamW:
-    - Nhóm tham số có `use_muon=True`: Cập nhật bằng đà trực giao bảo toàn năng lượng (GEO-Muon).
+    Bộ tối ưu hóa kết hợp GEO-Muon + AdamW (nâng cấp Moonlight RMS Scaling & Nesterov):
+    - Nhóm tham số có `use_muon=True`: Cập nhật bằng đà trực giao Nesterov chuẩn hóa RMS đồng nhất.
     - Nhóm tham số có `use_muon=False`: Cập nhật bằng AdamW tiêu chuẩn.
     """
     def __init__(
@@ -76,6 +73,8 @@ class GEOMuon(torch.optim.Optimizer):
         betas: Tuple[float, float] = (0.9, 0.95),
         eps: float = 1e-8,
         ns_steps: int = 5,
+        nesterov: bool = True,
+        rms_scale: float = 0.2,
     ):
         defaults = dict(
             lr=lr,
@@ -84,6 +83,8 @@ class GEOMuon(torch.optim.Optimizer):
             betas=betas,
             eps=eps,
             ns_steps=ns_steps,
+            nesterov=nesterov,
+            rms_scale=rms_scale,
         )
         super().__init__(params, defaults)
 
@@ -100,11 +101,10 @@ class GEOMuon(torch.optim.Optimizer):
             use_muon = group.get("use_muon", False)
 
             if use_muon:
-                # -------------------------------------------------------------
-                # Nhánh 1: GEO-Muon cho các ma trận trọng số 2D ẩn
-                # -------------------------------------------------------------
                 momentum = group["momentum"]
                 ns_steps = group.get("ns_steps", 5)
+                nesterov = group.get("nesterov", True)
+                rms_scale = group.get("rms_scale", 0.2)
 
                 for p in group["params"]:
                     if p.grad is None:
@@ -116,28 +116,18 @@ class GEOMuon(torch.optim.Optimizer):
                         state["momentum_buffer"] = torch.zeros_like(p)
 
                     buf = state["momentum_buffer"]
-                    # Cập nhật đà gradient (First moment accumulation)
-                    buf.mul_(momentum).add_(g)
+                    buf.lerp_(g, 1.0 - momentum)
+                    update_in = g.lerp(buf, momentum) if nesterov else buf
 
-                    # 1. Trực giao hóa ma trận bằng Newton-Schulz bậc 5
-                    O = zeropower_via_newtonschulz5(buf, steps=ns_steps)
+                    O = zeropower_via_newtonschulz5(update_in, steps=ns_steps)
+                    scale = rms_scale * math.sqrt(max(O.size(-2), O.size(-1)))
 
-                    # 2. Điều phối tỷ lệ cập nhật ma trận trực giao (Aspect-Ratio Polar Scale)
-                    # Giữ tỷ lệ bước nhảy ||delta_w|| / ||w|| đạt tỷ lệ chuẩn vàng ~ 1e-3
-                    scale = max(1.0, O.size(-2) / O.size(-1)) ** 0.5
-                    step_dir = O * scale
-
-                    # 3. Phạt suy giảm trọng số độc lập (Decoupled Weight Decay)
                     if weight_decay != 0:
-                        p.data.mul_(1.0 - lr * weight_decay)
+                        p.mul_(1.0 - lr * weight_decay)
 
-                    # 4. Áp dụng bước nhảy
-                    p.data.add_(step_dir, alpha=-lr)
+                    p.add_(O, alpha=-lr * scale)
 
             else:
-                # -------------------------------------------------------------
-                # Nhánh 2: AdamW tiêu chuẩn cho 1D / Embeddings / LM Head
-                # -------------------------------------------------------------
                 beta1, beta2 = group["betas"]
                 eps = group["eps"]
 
@@ -157,7 +147,6 @@ class GEOMuon(torch.optim.Optimizer):
                     exp_avg = state["exp_avg"]
                     exp_avg_sq = state["exp_avg_sq"]
 
-                    # Cập nhật first và second moments
                     exp_avg.mul_(beta1).add_(g, alpha=1 - beta1)
                     exp_avg_sq.mul_(beta2).addcmul_(g, g, value=1 - beta2)
 
@@ -167,11 +156,10 @@ class GEOMuon(torch.optim.Optimizer):
                     denom = (exp_avg_sq.sqrt() / (math.sqrt(bias_correction2))).add_(eps)
                     step_size = lr / bias_correction1
 
-                    # Decoupled Weight Decay
                     if weight_decay != 0:
-                        p.data.mul_(1.0 - lr * weight_decay)
+                        p.mul_(1.0 - lr * weight_decay)
 
-                    p.data.addcdiv_(exp_avg, denom, value=-step_size)
+                    p.addcdiv_(exp_avg, denom, value=-step_size)
 
         return loss
 
@@ -231,7 +219,7 @@ def create_optimizer(
                 or ("lm_head" in name)
             )
             is_gate = "gate" in name
-            is_norm = "norm" in name or param.ndim < 2
+            is_norm = "norm" in name or "connector." in name or param.ndim < 2
 
             if is_2d and not is_embed_or_head and not is_gate and not is_norm:
                 muon_params.append(param)
@@ -255,6 +243,8 @@ def create_optimizer(
                 "lr": lr,
                 "momentum": momentum,
                 "weight_decay": weight_decay,
+                "nesterov": True,
+                "rms_scale": 0.2,
             },
             {
                 "params": adamw_params,

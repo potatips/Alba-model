@@ -155,7 +155,17 @@ def _build_paper_optimizer(
                 adamw_decay.append(p)
         groups = []
         if muon_params:
-            groups.append({"params": muon_params, "use_muon": True, "lr": lr * 1.5, "momentum": 0.95, "weight_decay": weight_decay})
+            groups.append(
+                {
+                    "params": muon_params,
+                    "use_muon": True,
+                    "lr": lr,
+                    "momentum": 0.95,
+                    "weight_decay": weight_decay,
+                    "nesterov": True,
+                    "rms_scale": 0.2,
+                }
+            )
         if adamw_decay:
             groups.append({"params": adamw_decay, "use_muon": False, "lr": lr, "betas": (0.9, 0.95), "weight_decay": weight_decay})
         if adamw_nodecay:
@@ -1066,6 +1076,11 @@ def main() -> None:
             device = torch.device("cpu")
     else:
         device = torch.device(args.device)
+
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
     preset_cfg = dict(SCALE_PRESETS[args.preset])
     if args.dim > 0:
