@@ -8,11 +8,13 @@ import tokenize
 import unittest
 import torch
 
+from gor_research.paper_scaling_study import _build_paper_optimizer
 from gor_research.residuals import ALL_LM_RESIDUALS, GORv2Residual, _compute_gor_components, sinkhorn_knopp
 from gor_research.run_colab_study import MatrixResidualBlock
 from gor_research.transformer_lm import FromScratchTransformerLM, TransformerConfig, clone_transformer_backbone
 from src.config import ModelArgs
 from src.model import GeometricOrthogonalResidual, MiniLLM
+from src.optimizer import GEOMuon
 
 
 class TestGORResearch(unittest.TestCase):
@@ -312,6 +314,54 @@ class TestGORResearch(unittest.TestCase):
                     r_full["runs"][v][0]["tokens_seen"],
                     r_split["runs"][v][0]["tokens_seen"],
                 )
+
+    def test_geomuon_moonlight_rms_scaling_and_convergence(self):
+        torch.manual_seed(55)
+        for shape in ((384, 384), (1024, 384), (384, 1024)):
+            p_before = torch.randn(shape)
+            p = torch.nn.Parameter(p_before.clone())
+            p.grad = torch.randn(shape)
+            opt = GEOMuon([{"params": [p], "use_muon": True, "lr": 1e-3, "weight_decay": 0.0, "rms_scale": 0.2}])
+            opt.step()
+            update_rms = float((p.detach() - p_before).pow(2).mean().sqrt().item())
+            self.assertGreaterEqual(update_rms, 0.13e-3, f"Under-scaled RMS {update_rms} for shape {shape}")
+            self.assertLessEqual(update_rms, 0.26e-3, f"Over-scaled RMS {update_rms} for shape {shape}")
+
+        vocab, seq = 64, 32
+        base = torch.arange(vocab).repeat(4)
+        data = torch.stack([torch.roll(base[: seq + 1], shifts=i % 8) for i in range(128)])
+        train_b, val_b = data[:96], data[96:]
+        final_losses = {}
+        init_loss = None
+        for opt_name in ("adamw", "geomuon"):
+            torch.manual_seed(77)
+            cfg = TransformerConfig(
+                vocab_size=vocab,
+                dim=64,
+                n_layers=4,
+                n_heads=4,
+                max_seq_len=seq,
+                residual_type="attn_res_gor_v2",
+            )
+            lm = FromScratchTransformerLM(cfg)
+            opt = _build_paper_optimizer(lm, opt_name, lr=2e-3, weight_decay=0.01, device=torch.device("cpu"))
+            if init_loss is None:
+                with torch.no_grad():
+                    _, l0, _ = lm(val_b[:, :-1], targets=val_b[:, 1:])
+                    init_loss = float(l0.item())
+            for _ in range(50):
+                opt.zero_grad(set_to_none=True)
+                _, loss, _ = lm(train_b[:32, :-1], targets=train_b[:32, 1:])
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(lm.parameters(), 1.0)
+                opt.step()
+            with torch.no_grad():
+                _, l_end, _ = lm(val_b[:, :-1], targets=val_b[:, 1:])
+                final_losses[opt_name] = float(l_end.item())
+
+        print(f"\n  [Convergence 50-step] init={init_loss:.4f} | adamw={final_losses['adamw']:.4f} | geomuon={final_losses['geomuon']:.4f}")
+        self.assertLess(final_losses["geomuon"], init_loss * 0.6)
+        self.assertLessEqual(final_losses["geomuon"], final_losses["adamw"] + 0.15)
 
 
 if __name__ == "__main__":
