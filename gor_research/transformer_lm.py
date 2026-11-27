@@ -108,6 +108,10 @@ class TransformerSublayerBlock(nn.Module):
 
 def _effective_rank_norm(x: torch.Tensor) -> float:
     xf = x.detach().float()
+    if xf.ndim > 2:
+        xf = xf.reshape(-1, xf.size(-1))
+    if xf.size(0) > 512:
+        xf = xf[:512]
     xf = xf - xf.mean(dim=0, keepdim=True)
     s = torch.linalg.svdvals(xf)
     s = s[s > 1e-7]
@@ -233,6 +237,7 @@ class FromScratchTransformerLM(nn.Module):
                 "dilution_ratios": [],
                 "depth_renewal": [],
                 "erank_norm": [],
+                "input_erank_norm": [],
             }
             x0_norm_val = float(torch.linalg.vector_norm(x.detach().float(), dim=-1).mean().item())
             prev_h = x.detach().float().reshape(-1, self.config.dim)
@@ -314,6 +319,8 @@ class FromScratchTransformerLM(nn.Module):
         n_rows = min(512, cur_flat.size(0))
         geom["depth_renewal"].append(1.0 - _linear_cka(prev_h_flat[:n_rows], cur_flat[:n_rows]))
         geom["erank_norm"].append(_effective_rank_norm(cur_flat[:n_rows]))
+        h_flat = hf.reshape(-1, self.config.dim)
+        geom.setdefault("input_erank_norm", []).append(_effective_rank_norm(h_flat[:n_rows]))
 
 
 def clone_transformer_backbone(source: FromScratchTransformerLM, target: FromScratchTransformerLM) -> None:

@@ -84,6 +84,7 @@ def build_synthetic_paper_corpus(
     train_tokens: int = 131072,
     val_tokens: int = 16384,
     seed: int = 42,
+    downstream_items: int = 160,
 ) -> PaperTokenCorpus:
     os.makedirs(cache_dir, exist_ok=True)
     gen = torch.Generator().manual_seed(seed)
@@ -127,6 +128,7 @@ def build_synthetic_paper_corpus(
             "tokenizer": "byte_synthetic",
             "train_tokens": int(len(train_arr)),
             "val_tokens": int(len(val_arr)),
+            "downstream_items": int(downstream_items),
         },
     )
 
@@ -257,6 +259,7 @@ def build_or_load_fineweb_edu_corpus(
     val_path = os.path.join(cache_dir, "val_tokens.npy")
     meta_path = os.path.join(cache_dir, "corpus_meta.json")
     ood_path = os.path.join(cache_dir, "ood_eval.pt")
+    downstream_path = os.path.join(cache_dir, f"downstream_{downstream_items}.json")
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     if tokenizer.eos_token_id is None and tokenizer.pad_token_id is not None:
@@ -357,35 +360,38 @@ def build_or_load_fineweb_edu_corpus(
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
 
+    if os.path.exists(downstream_path):
+        with open(downstream_path, "r", encoding="utf-8") as f:
+            downstream_tasks = json.load(f)
+    else:
+        downstream_tasks = _load_downstream_tasks(max_per_task=downstream_items)
+        with open(downstream_path, "w", encoding="utf-8") as f:
+            json.dump(downstream_tasks, f)
+
     if os.path.exists(ood_path):
         saved_ood = torch.load(ood_path, map_location="cpu", weights_only=False)
         if saved_ood.get("seq_len") == seq_len and saved_ood.get("tokenizer") == tokenizer_name:
             ood_splits = saved_ood["ood_splits"]
-            downstream_tasks = saved_ood["downstream_tasks"]
             ood_counts = saved_ood["ood_counts"]
         else:
             ood_splits, ood_counts = _load_ood_splits(tokenizer, seq_len, max_ood_tokens=max_ood_tokens)
-            downstream_tasks = _load_downstream_tasks(max_per_task=downstream_items)
             torch.save(
                 {
                     "seq_len": seq_len,
                     "tokenizer": tokenizer_name,
                     "ood_splits": ood_splits,
                     "ood_counts": ood_counts,
-                    "downstream_tasks": downstream_tasks,
                 },
                 ood_path,
             )
     else:
         ood_splits, ood_counts = _load_ood_splits(tokenizer, seq_len, max_ood_tokens=max_ood_tokens)
-        downstream_tasks = _load_downstream_tasks(max_per_task=downstream_items)
         torch.save(
             {
                 "seq_len": seq_len,
                 "tokenizer": tokenizer_name,
                 "ood_splits": ood_splits,
                 "ood_counts": ood_counts,
-                "downstream_tasks": downstream_tasks,
             },
             ood_path,
         )
@@ -403,6 +409,7 @@ def build_or_load_fineweb_edu_corpus(
         provenance={
             **meta,
             "ood_counts": ood_counts,
+            "downstream_items": int(downstream_items),
             "downstream_counts": {k: len(v) for k, v in downstream_tasks.items()},
         },
     )

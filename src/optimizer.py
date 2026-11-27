@@ -15,9 +15,16 @@ Các đột phá cốt lõi:
 """
 
 import math
+from collections import defaultdict
+from typing import List, Dict, Any, Optional, Tuple
 import torch
 import torch.nn as nn
-from typing import List, Dict, Any, Optional, Tuple
+
+try:
+    from torch.optim import _functional as F_opt
+    _HAS_FUNCTIONAL_ADAMW = hasattr(F_opt, "adamw")
+except ImportError:
+    _HAS_FUNCTIONAL_ADAMW = False
 
 
 def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
@@ -60,9 +67,13 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e
 
 class GEOMuon(torch.optim.Optimizer):
     """
-    Bộ tối ưu hóa kết hợp GEO-Muon + AdamW (nâng cấp Moonlight RMS Scaling & Nesterov):
-    - Nhóm tham số có `use_muon=True`: Cập nhật bằng đà trực giao Nesterov chuẩn hóa RMS đồng nhất.
-    - Nhóm tham số có `use_muon=False`: Cập nhật bằng AdamW tiêu chuẩn.
+    Bộ tối ưu hóa kết hợp GEO-Muon + AdamW v2.1 (Batched Newton-Schulz & Vectorized AdamW):
+    - Nhóm tham số có `use_muon=True`: Gom cụm các ma trận 2D theo (shape, dtype, device) để
+      thực hiện Batched Newton-Schulz bậc 5 một lần (B, m, n) với Moonlight RMS scaling & Nesterov momentum.
+      Các tham số không phải 2D (ndim != 2) được xử lý singleton độc lập.
+    - Nhóm tham số có `use_muon=False`: Vectorized AdamW tối ưu hiệu năng cao qua
+      `torch.optim._functional.adamw` (hỗ trợ foreach/fused và tự động fallback), tương thích
+      hoàn toàn checkpoint state_dict với step dạng int hoặc 0-dim tensor.
     """
     def __init__(
         self,
@@ -75,6 +86,8 @@ class GEOMuon(torch.optim.Optimizer):
         ns_steps: int = 5,
         nesterov: bool = True,
         rms_scale: float = 0.2,
+        foreach: Optional[bool] = None,
+        fused: Optional[bool] = None,
     ):
         defaults = dict(
             lr=lr,
@@ -85,6 +98,8 @@ class GEOMuon(torch.optim.Optimizer):
             ns_steps=ns_steps,
             nesterov=nesterov,
             rms_scale=rms_scale,
+            foreach=foreach,
+            fused=fused,
         )
         super().__init__(params, defaults)
 
@@ -106,6 +121,9 @@ class GEOMuon(torch.optim.Optimizer):
                 nesterov = group.get("nesterov", True)
                 rms_scale = group.get("rms_scale", 0.2)
 
+                buckets = defaultdict(list)
+                singletons = []
+
                 for p in group["params"]:
                     if p.grad is None:
                         continue
@@ -119,47 +137,158 @@ class GEOMuon(torch.optim.Optimizer):
                     buf.lerp_(g, 1.0 - momentum)
                     update_in = g.lerp(buf, momentum) if nesterov else buf
 
+                    if p.ndim == 2:
+                        key = (p.shape, p.dtype, p.device)
+                        buckets[key].append((p, update_in))
+                    else:
+                        singletons.append((p, update_in))
+
+                # Process 2D buckets (batched if >= 2 tensors, singleton otherwise)
+                for (shape, dtype, device), bucket in buckets.items():
+                    if len(bucket) >= 2:
+                        params, update_ins = zip(*bucket)
+                        stacked = torch.stack(update_ins, dim=0)  # shape (B, m, n)
+                        O_stacked = zeropower_via_newtonschulz5(stacked, steps=ns_steps)
+                        m, n = shape[-2], shape[-1]
+                        scale = rms_scale * math.sqrt(max(m, n))
+
+                        for p, O in zip(params, O_stacked.unbind(dim=0)):
+                            if weight_decay != 0:
+                                p.mul_(1.0 - lr * weight_decay)
+                            p.add_(O, alpha=-lr * scale)
+                    else:
+                        p, update_in = bucket[0]
+                        O = zeropower_via_newtonschulz5(update_in, steps=ns_steps)
+                        scale = rms_scale * math.sqrt(max(O.size(-2), O.size(-1)))
+
+                        if weight_decay != 0:
+                            p.mul_(1.0 - lr * weight_decay)
+                        p.add_(O, alpha=-lr * scale)
+
+                # Process non-2D tensors in singleton handling
+                for p, update_in in singletons:
                     O = zeropower_via_newtonschulz5(update_in, steps=ns_steps)
                     scale = rms_scale * math.sqrt(max(O.size(-2), O.size(-1)))
 
                     if weight_decay != 0:
                         p.mul_(1.0 - lr * weight_decay)
-
                     p.add_(O, alpha=-lr * scale)
 
             else:
                 beta1, beta2 = group["betas"]
                 eps = group["eps"]
 
+                params_with_grad = []
+                grads = []
+                exp_avgs = []
+                exp_avg_sqs = []
+                state_steps = []
+
                 for p in group["params"]:
                     if p.grad is None:
                         continue
-                    g = p.grad
+                    params_with_grad.append(p)
+                    grads.append(p.grad)
                     state = self.state[p]
 
                     if len(state) == 0:
-                        state["step"] = 0
-                        state["exp_avg"] = torch.zeros_like(p)
-                        state["exp_avg_sq"] = torch.zeros_like(p)
+                        state["step"] = torch.tensor(0.0, dtype=torch.float32)
+                        state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                        state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    else:
+                        if "step" not in state:
+                            state["step"] = torch.tensor(0.0, dtype=torch.float32)
+                        elif not torch.is_tensor(state["step"]):
+                            state["step"] = torch.tensor(float(state["step"]), dtype=torch.float32)
+                        elif not state["step"].is_floating_point():
+                            state["step"] = state["step"].to(dtype=torch.float32)
 
-                    state["step"] += 1
-                    step_t = state["step"]
-                    exp_avg = state["exp_avg"]
-                    exp_avg_sq = state["exp_avg_sq"]
+                        if "exp_avg" not in state:
+                            state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                        if "exp_avg_sq" not in state:
+                            state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
 
-                    exp_avg.mul_(beta1).add_(g, alpha=1 - beta1)
-                    exp_avg_sq.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+                    exp_avgs.append(state["exp_avg"])
+                    exp_avg_sqs.append(state["exp_avg_sq"])
+                    state_steps.append(state["step"])
 
-                    bias_correction1 = 1 - beta1 ** step_t
-                    bias_correction2 = 1 - beta2 ** step_t
+                if not params_with_grad:
+                    continue
 
-                    denom = (exp_avg_sq.sqrt() / (math.sqrt(bias_correction2))).add_(eps)
-                    step_size = lr / bias_correction1
+                executed = False
+                if _HAS_FUNCTIONAL_ADAMW:
+                    use_fused = group.get("fused", None)
+                    use_foreach = group.get("foreach", None)
 
-                    if weight_decay != 0:
-                        p.mul_(1.0 - lr * weight_decay)
+                    if use_fused is None and use_foreach is None:
+                        use_foreach = True
 
-                    p.addcdiv_(exp_avg, denom, value=-step_size)
+                    try:
+                        adamw_kwargs = dict(
+                            amsgrad=False,
+                            beta1=beta1,
+                            beta2=beta2,
+                            lr=lr,
+                            weight_decay=weight_decay,
+                            eps=eps,
+                            maximize=False,
+                        )
+                        if use_foreach is not None:
+                            adamw_kwargs["foreach"] = use_foreach
+                        if use_fused is not None:
+                            adamw_kwargs["fused"] = use_fused
+
+                        F_opt.adamw(
+                            params_with_grad,
+                            grads,
+                            exp_avgs,
+                            exp_avg_sqs,
+                            [],
+                            state_steps,
+                            **adamw_kwargs,
+                        )
+                        executed = True
+                    except Exception:
+                        try:
+                            F_opt.adamw(
+                                params_with_grad,
+                                grads,
+                                exp_avgs,
+                                exp_avg_sqs,
+                                [],
+                                state_steps,
+                                amsgrad=False,
+                                beta1=beta1,
+                                beta2=beta2,
+                                lr=lr,
+                                weight_decay=weight_decay,
+                                eps=eps,
+                                maximize=False,
+                                foreach=False,
+                            )
+                            executed = True
+                        except Exception:
+                            executed = False
+
+                if not executed:
+                    for p, g, exp_avg, exp_avg_sq, step_tensor in zip(
+                        params_with_grad, grads, exp_avgs, exp_avg_sqs, state_steps
+                    ):
+                        step_tensor.add_(1.0)
+                        step_t = step_tensor.item()
+                        exp_avg.mul_(beta1).add_(g, alpha=1 - beta1)
+                        exp_avg_sq.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+
+                        bias_correction1 = 1 - beta1 ** step_t
+                        bias_correction2 = 1 - beta2 ** step_t
+
+                        denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+                        step_size = lr / bias_correction1
+
+                        if weight_decay != 0:
+                            p.mul_(1.0 - lr * weight_decay)
+
+                        p.addcdiv_(exp_avg, denom, value=-step_size)
 
         return loss
 
