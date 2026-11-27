@@ -42,6 +42,8 @@ SCALE_PRESETS: Dict[str, Dict[str, object]] = {
         "corpus_tokens": 131072,
         "val_tokens": 16384,
         "grad_ckpt": False,
+        "attn_num_blocks": 4,
+        "downstream_items": 16,
     },
     "ablation_40m": {
         "dim": 384,
@@ -55,6 +57,8 @@ SCALE_PRESETS: Dict[str, Dict[str, object]] = {
         "corpus_tokens": 60_000_000,
         "val_tokens": 1_000_000,
         "grad_ckpt": False,
+        "attn_num_blocks": 8,
+        "downstream_items": 160,
     },
     "scale_125m": {
         "dim": 768,
@@ -63,24 +67,28 @@ SCALE_PRESETS: Dict[str, Dict[str, object]] = {
         "seq_len": 1024,
         "batch_size": 8,
         "grad_accum": 8,
-        "steps": 4500,
+        "steps": 20000,
         "lr": 5e-4,
-        "corpus_tokens": 300_000_000,
+        "corpus_tokens": 1_350_000_000,
         "val_tokens": 2_000_000,
         "grad_ckpt": False,
+        "attn_num_blocks": 8,
+        "downstream_items": 500,
     },
     "scale_220m": {
         "dim": 896,
         "n_layers": 18,
         "n_heads": 14,
         "seq_len": 1024,
-        "batch_size": 6,
-        "grad_accum": 10,
-        "steps": 6000,
+        "batch_size": 12,
+        "grad_accum": 5,
+        "steps": 16384,
         "lr": 4e-4,
-        "corpus_tokens": 400_000_000,
+        "corpus_tokens": 1_050_000_000,
         "val_tokens": 2_000_000,
-        "grad_ckpt": True,
+        "grad_ckpt": False,
+        "attn_num_blocks": 9,
+        "downstream_items": 500,
     },
     "scale_300m": {
         "dim": 1024,
@@ -89,11 +97,13 @@ SCALE_PRESETS: Dict[str, Dict[str, object]] = {
         "seq_len": 1024,
         "batch_size": 4,
         "grad_accum": 16,
-        "steps": 7500,
+        "steps": 16384,
         "lr": 3e-4,
-        "corpus_tokens": 500_000_000,
+        "corpus_tokens": 1_100_000_000,
         "val_tokens": 2_000_000,
         "grad_ckpt": True,
+        "attn_num_blocks": 10,
+        "downstream_items": 500,
     },
 }
 
@@ -124,6 +134,10 @@ PAPER_COLORS = {
 }
 
 
+def _compute_warmup_steps(steps: int) -> int:
+    return min(500, max(10, int(0.06 * steps)))
+
+
 def _resolve_variant_spec(variant: str, base_layers: int, iso_extra_layers: int) -> Tuple[str, int]:
     if variant == "pre_norm_isotime":
         extra = iso_extra_layers if iso_extra_layers > 0 else max(2, round(0.25 * base_layers))
@@ -137,12 +151,17 @@ def _build_paper_optimizer(
     lr: float,
     weight_decay: float,
     device: torch.device,
+    connector_lr_mult: float = 0.3,
+    connector_wd: float = 0.02,
 ) -> torch.optim.Optimizer:
     opt_key = optimizer_name.lower()
     if opt_key == "geomuon":
-        muon_params, adamw_decay, adamw_nodecay = [], [], []
+        muon_params, adamw_decay, adamw_nodecay, connector_dq = [], [], [], []
         for name, p in model.named_parameters():
             if not p.requires_grad:
+                continue
+            if "depth_queries" in name:
+                connector_dq.append(p)
                 continue
             is_connector = name.startswith("connector.")
             is_embed = "tok_embeddings" in name or "lm_head" in name
@@ -164,6 +183,16 @@ def _build_paper_optimizer(
                     "weight_decay": weight_decay,
                     "nesterov": True,
                     "rms_scale": 0.2,
+                }
+            )
+        if connector_dq:
+            groups.append(
+                {
+                    "params": connector_dq,
+                    "use_muon": False,
+                    "lr": lr * connector_lr_mult,
+                    "betas": (0.9, 0.95),
+                    "weight_decay": connector_wd,
                 }
             )
         if adamw_decay:
@@ -349,6 +378,8 @@ def _train_single_run(
     session_t0: float,
     output_dir: str,
     device: torch.device,
+    connector_lr_mult: float = 0.3,
+    connector_wd: float = 0.02,
 ) -> Optional[Dict[str, object]]:
     steps = int(preset_cfg["steps"])
     run_file = os.path.join(output_dir, "runs", f"{variant}__seed{seed}.json")
@@ -372,6 +403,7 @@ def _train_single_run(
     grad_accum = int(preset_cfg["grad_accum"])
     lr = float(preset_cfg["lr"])
     grad_ckpt = bool(preset_cfg["grad_ckpt"])
+    attn_num_blocks = int(preset_cfg.get("attn_num_blocks", 8))
 
     res_type, actual_layers = _resolve_variant_spec(variant, base_layers, iso_extra_layers)
     amp_enabled = device.type == "cuda"
@@ -390,6 +422,7 @@ def _train_single_run(
         n_heads=n_heads,
         max_seq_len=seq_len,
         residual_type="pre_norm",
+        attn_num_blocks=attn_num_blocks,
     )
     ref_model = FromScratchTransformerLM(ref_cfg)
 
@@ -401,6 +434,7 @@ def _train_single_run(
         max_seq_len=seq_len,
         residual_type=res_type,
         gradient_checkpointing=grad_ckpt,
+        attn_num_blocks=attn_num_blocks,
     )
     torch.manual_seed(seed)
     base_model = FromScratchTransformerLM(cfg).to(device)
@@ -415,9 +449,17 @@ def _train_single_run(
     val_ds = MemmapTokenDataset(corpus.val_path, seq_len=seq_len, stride=seq_len)
     val_blocks = val_ds.get_eval_blocks(max_blocks=64)
 
-    opt = _build_paper_optimizer(base_model, optimizer_name, lr=lr, weight_decay=0.1, device=device)
+    opt = _build_paper_optimizer(
+        base_model,
+        optimizer_name,
+        lr=lr,
+        weight_decay=0.1,
+        device=device,
+        connector_lr_mult=connector_lr_mult,
+        connector_wd=connector_wd,
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
-    warmup_steps = max(10, int(0.06 * steps))
+    warmup_steps = _compute_warmup_steps(steps)
 
     def lr_lambda(step_idx: int) -> float:
         if step_idx < warmup_steps:
@@ -647,6 +689,11 @@ def _train_single_run(
     growth_list = geom["norm_growth"] if geom else [1.0]
     renewal_list = geom["depth_renewal"] if geom else [0.0]
     erank_list = geom["erank_norm"] if geom else [0.0]
+    if geom and "input_erank_norm" in geom and len(geom["input_erank_norm"]) > 0:
+        input_erank_list = [float(v) for v in geom["input_erank_norm"]]
+    else:
+        input_erank_list = [float(v) for v in erank_list]
+    avg_input_erank = float(sum(input_erank_list) / max(len(input_erank_list), 1))
 
     approx_total_flops = 6.0 * float(non_emb_params) * float(total_tokens_seen)
 
@@ -677,6 +724,7 @@ def _train_single_run(
         "final_norm_growth": growth_list[-1],
         "avg_depth_renewal": sum(renewal_list) / max(len(renewal_list), 1),
         "avg_erank_norm": sum(erank_list) / max(len(erank_list), 1),
+        "avg_input_erank_norm": avg_input_erank,
         "tok_per_sec": tok_per_sec,
         "peak_vram_gb": peak_vram_gb,
         "train_time_sec": elapsed,
@@ -689,6 +737,7 @@ def _train_single_run(
         "layer_norm_growth": growth_list,
         "layer_renewal": renewal_list,
         "layer_erank": erank_list,
+        "layer_input_erank": input_erank_list,
     }
 
     os.makedirs(os.path.dirname(run_file), exist_ok=True)
@@ -725,6 +774,7 @@ def aggregate_seed_runs(variants: List[str], runs: Dict[str, List[Dict[str, obje
         ood_bpb_m, ood_bpb_s = _mean_std([float(r["ood_avg_bpb"]) for r in v_runs])
         conf_m, conf_s = _mean_std([float(r["avg_conflict_pct"]) for r in v_runs])
         erank_m, erank_s = _mean_std([float(r["avg_erank_norm"]) for r in v_runs])
+        in_erank_m, in_erank_s = _mean_std([float(r.get("avg_input_erank_norm", r["avg_erank_norm"])) for r in v_runs])
         ren_m, ren_s = _mean_std([float(r["avg_depth_renewal"]) for r in v_runs])
         tps_m, tps_s = _mean_std([float(r["tok_per_sec"]) for r in v_runs])
         vram_m, _ = _mean_std([float(r["peak_vram_gb"]) for r in v_runs])
@@ -754,6 +804,11 @@ def aggregate_seed_runs(variants: List[str], runs: Dict[str, List[Dict[str, obje
         n_sub = len(first["layer_conflict"])
         depth_conf_m = [ _mean_std([float(r["layer_conflict"][i]) for r in v_runs])[0] for i in range(n_sub) ]
         depth_erank_m = [ _mean_std([float(r["layer_erank"][i]) for r in v_runs])[0] for i in range(n_sub) ]
+        layer_in_erank = first.get("layer_input_erank", first["layer_erank"])
+        depth_in_erank_m = [
+            _mean_std([float(r.get("layer_input_erank", r["layer_erank"])[i]) for r in v_runs])[0]
+            for i in range(len(layer_in_erank))
+        ]
         depth_ren_m = [ _mean_std([float(r["layer_renewal"][i]) for r in v_runs])[0] for i in range(n_sub) ]
 
         agg[v] = {
@@ -772,6 +827,8 @@ def aggregate_seed_runs(variants: List[str], runs: Dict[str, List[Dict[str, obje
             "downstream": ds_summary,
             "conflict_pct": {"mean": conf_m, "std": conf_s},
             "erank_norm": {"mean": erank_m, "std": erank_s},
+            "avg_input_erank_norm": {"mean": in_erank_m, "std": in_erank_s},
+            "input_erank_norm": {"mean": in_erank_m, "std": in_erank_s},
             "depth_renewal": {"mean": ren_m, "std": ren_s},
             "tok_per_sec": {"mean": tps_m, "std": tps_s},
             "peak_vram_gb": vram_m,
@@ -781,6 +838,7 @@ def aggregate_seed_runs(variants: List[str], runs: Dict[str, List[Dict[str, obje
             "curve_val_bpb_std": curve_std,
             "depth_conflict_mean": depth_conf_m,
             "depth_erank_mean": depth_erank_m,
+            "depth_input_erank_mean": depth_in_erank_m,
             "depth_renewal_mean": depth_ren_m,
         }
     return agg
@@ -1033,7 +1091,7 @@ def render_paper_assets(payload: Dict[str, object], png_path: str, pdf_path: str
         f.write(html)
 
 
-def main() -> None:
+def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Multi-scale 100M+ paper benchmark suite for Alba residual architectures.")
     parser.add_argument("--preset", type=str, default="scale_125m", choices=list(SCALE_PRESETS.keys()))
     parser.add_argument("--variants", type=str, default=",".join(DEFAULT_PAPER_VARIANTS))
@@ -1054,8 +1112,14 @@ def main() -> None:
     parser.add_argument("--corpus-tokens", type=int, default=0)
     parser.add_argument("--lr", type=float, default=0.0)
     parser.add_argument("--iso-extra-layers", type=int, default=0)
+    parser.add_argument("--attn-num-blocks", type=int, default=0)
+    parser.add_argument("--downstream-items", type=int, default=0)
     parser.add_argument("--grad-ckpt", action="store_true")
-    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--no-grad-ckpt", action="store_true")
+    parser.add_argument("--geomuon-connector-lr-mult", type=float, default=0.3)
+    parser.add_argument("--geomuon-connector-wd", type=float, default=0.02)
+    parser.add_argument("--compile", action="store_true", default=False)
+    parser.add_argument("--no-compile", dest="compile", action="store_false")
     parser.add_argument("--save-checkpoints", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--ckpt-every", type=int, default=250)
@@ -1065,6 +1129,11 @@ def main() -> None:
     parser.add_argument("--keep-step-checkpoints", action="store_true")
     parser.add_argument("--cache-dir", type=str, default="gor_research/paper_cache")
     parser.add_argument("--output-dir", type=str, default="gor_research/paper_results")
+    return parser
+
+
+def main() -> None:
+    parser = _build_cli_parser()
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -1101,16 +1170,24 @@ def main() -> None:
         preset_cfg["corpus_tokens"] = args.corpus_tokens
     if args.lr > 0.0:
         preset_cfg["lr"] = args.lr
+    if args.attn_num_blocks > 0:
+        preset_cfg["attn_num_blocks"] = args.attn_num_blocks
+    if args.downstream_items > 0:
+        preset_cfg["downstream_items"] = args.downstream_items
     if args.grad_ckpt:
         preset_cfg["grad_ckpt"] = True
+    if args.no_grad_ckpt:
+        preset_cfg["grad_ckpt"] = False
 
     os.makedirs(args.output_dir, exist_ok=True)
+    downstream_items = int(preset_cfg.get("downstream_items", 160))
     if args.synthetic_lm or args.preset == "smoke":
         corpus = build_synthetic_paper_corpus(
             cache_dir=args.cache_dir,
             seq_len=int(preset_cfg["seq_len"]),
             train_tokens=int(preset_cfg["corpus_tokens"]),
             val_tokens=int(preset_cfg["val_tokens"]),
+            downstream_items=downstream_items,
         )
     else:
         corpus = build_or_load_fineweb_edu_corpus(
@@ -1121,6 +1198,7 @@ def main() -> None:
             tokenizer_name=args.tokenizer,
             dataset_name=args.dataset,
             dataset_config=args.dataset_config,
+            downstream_items=downstream_items,
         )
 
     variants = [v.strip() for v in args.variants.split(",") if v.strip()]
@@ -1150,6 +1228,8 @@ def main() -> None:
                 session_t0=session_t0,
                 output_dir=args.output_dir,
                 device=device,
+                connector_lr_mult=args.geomuon_connector_lr_mult,
+                connector_wd=args.geomuon_connector_wd,
             )
             if res is None:
                 print(
